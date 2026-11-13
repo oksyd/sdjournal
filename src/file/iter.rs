@@ -1,9 +1,9 @@
-use super::JournalFile;
 use super::index::DataObjectRef;
+use super::{EntryMeta, JournalFile};
 use crate::error::{LimitKind, Result, SdJournalError};
 use crate::format::{OBJECT_ENTRY_ARRAY, ObjectHeader, STATE_ONLINE};
 use crate::util::{read_u32_le, read_u64_le};
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 const ENTRY_ARRAY_CHUNK_BYTES: usize = 4096;
@@ -15,6 +15,26 @@ struct EntryArrayDescriptor {
     used_items: usize,
     first: u64,
     last: u64,
+}
+
+impl EntryArrayDescriptor {
+    fn validate_layout(&self, file: &JournalFile) -> Result<()> {
+        let current = read_entry_array_layout(file, self.offset)?;
+        // Appending may extend an originally final link, but cannot change a committed
+        // array's size or redirect an existing link to a different array.
+        if current.size != self.layout.size
+            || (self.layout.next_entry_array_offset != 0
+                && current.next_entry_array_offset != self.layout.next_entry_array_offset)
+            || (current.next_entry_array_offset != 0
+                && current.next_entry_array_offset <= self.offset)
+        {
+            return Err(file.metadata_error(
+                Some(self.offset),
+                "ENTRY_ARRAY layout changed after snapshot validation",
+            ));
+        }
+        Ok(())
+    }
 }
 
 pub(super) struct EntryIndex {
@@ -43,8 +63,8 @@ impl EntryIndex {
 struct EntryArrayCursor {
     file: JournalFile,
     reverse: bool,
-    arrays: Vec<EntryArrayDescriptor>,
-    current_array_idx: isize,
+    index: Arc<EntryIndex>,
+    current_array_idx: usize,
     next_item_idx: usize,
     current_items: VecDeque<u64>,
     previous_offset: Option<u64>,
@@ -53,9 +73,10 @@ struct EntryArrayCursor {
 }
 
 impl EntryArrayCursor {
-    fn new(file: JournalFile, arrays: Vec<EntryArrayDescriptor>, reverse: bool) -> Self {
+    fn new(file: JournalFile, index: Arc<EntryIndex>, reverse: bool) -> Self {
+        let arrays = &index.arrays;
         let current_array_idx = if reverse {
-            isize::try_from(arrays.len()).unwrap_or(0) - 1
+            arrays.len().saturating_sub(1)
         } else {
             0
         };
@@ -68,7 +89,7 @@ impl EntryArrayCursor {
         Self {
             file,
             reverse,
-            arrays,
+            index,
             current_array_idx,
             next_item_idx,
             current_items: VecDeque::new(),
@@ -80,13 +101,14 @@ impl EntryArrayCursor {
 
     fn new_after_offset(
         file: JournalFile,
-        arrays: Vec<EntryArrayDescriptor>,
+        index: Arc<EntryIndex>,
         reverse: bool,
         after_entry_offset: u64,
     ) -> Result<Self> {
-        let Some(array_idx) = locate_entry_array_for_offset(&arrays, reverse, after_entry_offset)
+        let arrays = &index.arrays;
+        let Some(array_idx) = locate_entry_array_for_offset(arrays, reverse, after_entry_offset)
         else {
-            let mut cursor = Self::new(file, arrays, reverse);
+            let mut cursor = Self::new(file, index, reverse);
             cursor.exhausted = true;
             return Ok(cursor);
         };
@@ -95,13 +117,13 @@ impl EntryArrayCursor {
         let mut cursor = Self {
             file,
             reverse,
-            arrays,
-            current_array_idx: isize::try_from(array_idx).unwrap_or(0),
+            index,
+            current_array_idx: array_idx,
             next_item_idx: split,
             current_items: VecDeque::new(),
             previous_offset: Some(after_entry_offset),
-            // A lazy query normally asks this cursor for one item and then drops it. Reading just
-            // that item avoids re-reading an overlapping 4 KiB suffix chunk for every entry.
+            // Cursor resolution normally reads one offset and then drops this iterator. Read
+            // just that item before switching to full chunks for callers that keep iterating.
             first_refill_single: true,
             exhausted: false,
         };
@@ -111,10 +133,7 @@ impl EntryArrayCursor {
 
     fn skip_exhausted_array(&mut self) {
         loop {
-            let Some(array_idx) = usize::try_from(self.current_array_idx)
-                .ok()
-                .filter(|idx| *idx < self.arrays.len())
-            else {
+            let Some(array) = self.index.arrays.get(self.current_array_idx) else {
                 self.exhausted = true;
                 return;
             };
@@ -122,18 +141,19 @@ impl EntryArrayCursor {
             let has_items = if self.reverse {
                 self.next_item_idx != 0
             } else {
-                self.next_item_idx < self.arrays[array_idx].used_items
+                self.next_item_idx < array.used_items
             };
             if has_items {
                 return;
             }
 
             if self.reverse {
-                self.current_array_idx -= 1;
-                self.next_item_idx = usize::try_from(self.current_array_idx)
-                    .ok()
-                    .and_then(|idx| self.arrays.get(idx))
-                    .map_or(0, |array| array.used_items);
+                let Some(previous) = self.current_array_idx.checked_sub(1) else {
+                    self.exhausted = true;
+                    return;
+                };
+                self.current_array_idx = previous;
+                self.next_item_idx = self.index.arrays[previous].used_items;
             } else {
                 self.current_array_idx += 1;
                 self.next_item_idx = 0;
@@ -151,13 +171,10 @@ impl EntryArrayCursor {
             return Ok(());
         }
 
-        let array_idx =
-            usize::try_from(self.current_array_idx).map_err(|_| SdJournalError::Corrupt {
-                path: Some(self.file.inner.path.clone()),
-                offset: None,
-                reason: "ENTRY_ARRAY cursor index is out of range".to_string(),
-            })?;
-        let array = self.arrays[array_idx];
+        let array = self.index.arrays[self.current_array_idx];
+        // Reuse the validated snapshot prefix, but do not trust a cached header after the
+        // underlying file changes.
+        array.validate_layout(&self.file)?;
         let items_per_chunk = if self.first_refill_single {
             1
         } else {
@@ -222,9 +239,7 @@ impl Iterator for EntryArrayCursor {
 }
 
 pub(crate) struct DataEntryOffsetIter {
-    reverse: bool,
-    first_entry_offset: u64,
-    first_pending: bool,
+    first_entry_offset: Option<u64>,
     arrays: EntryArrayCursor,
     entry_index: Arc<EntryIndex>,
     exhausted: bool,
@@ -232,15 +247,6 @@ pub(crate) struct DataEntryOffsetIter {
 
 impl DataEntryOffsetIter {
     pub(crate) fn new(file: JournalFile, data: DataObjectRef, reverse: bool) -> Result<Self> {
-        Self::new_after_offset(file, data, reverse, None)
-    }
-
-    pub(crate) fn new_after_offset(
-        file: JournalFile,
-        data: DataObjectRef,
-        reverse: bool,
-        after_entry_offset: Option<u64>,
-    ) -> Result<Self> {
         validate_data_entry_metadata(&file, data)?;
         let entry_index = file.committed_entry_index()?;
         let descriptors = collect_entry_array_descriptors(
@@ -261,32 +267,18 @@ impl DataEntryOffsetIter {
                 ),
             ));
         }
-        let first_pending = data.entry_offset != 0;
-        let arrays = match after_entry_offset {
-            Some(after) if reverse || data.entry_offset == 0 || data.entry_offset <= after => {
-                EntryArrayCursor::new_after_offset(file, descriptors, reverse, after)?
-            }
-            _ => EntryArrayCursor::new(file, descriptors, reverse),
-        };
-        let mut iter = Self {
-            reverse,
-            first_entry_offset: data.entry_offset,
-            first_pending,
-            arrays,
+        Ok(Self {
+            first_entry_offset: (data.entry_offset != 0).then_some(data.entry_offset),
+            arrays: EntryArrayCursor::new(
+                file,
+                Arc::new(EntryIndex {
+                    arrays: descriptors,
+                }),
+                reverse,
+            ),
             entry_index,
             exhausted: false,
-        };
-
-        if let Some(after) = after_entry_offset {
-            if reverse {
-                iter.first_pending =
-                    iter.first_entry_offset != 0 && iter.first_entry_offset < after;
-            } else if iter.first_entry_offset == 0 || iter.first_entry_offset <= after {
-                iter.first_pending = false;
-            }
-        }
-
-        Ok(iter)
+        })
     }
 
     fn checked_entry_offset(&mut self, offset: u64) -> Result<u64> {
@@ -316,12 +308,11 @@ impl Iterator for DataEntryOffsetIter {
             return None;
         }
 
-        if !self.reverse && self.first_pending {
-            self.first_pending = false;
-            if self.first_entry_offset != 0 {
-                self.arrays.previous_offset = Some(self.first_entry_offset);
-                return Some(self.checked_entry_offset(self.first_entry_offset));
-            }
+        if !self.arrays.reverse
+            && let Some(offset) = self.first_entry_offset.take()
+        {
+            self.arrays.previous_offset = Some(offset);
+            return Some(self.checked_entry_offset(offset));
         }
 
         if let Some(offset) = self.arrays.next() {
@@ -331,23 +322,21 @@ impl Iterator for DataEntryOffsetIter {
             return Some(offset.and_then(|offset| self.checked_entry_offset(offset)));
         }
 
-        if self.reverse && self.first_pending {
-            self.first_pending = false;
-            if self.first_entry_offset != 0 {
-                if let Some(previous) = self.arrays.previous_offset
-                    && self.first_entry_offset >= previous
-                {
-                    self.exhausted = true;
-                    return Some(Err(self.arrays.file.metadata_error(
-                        Some(self.first_entry_offset),
-                        format!(
-                            "DATA entry offsets are not strictly increasing ({} >= {previous})",
-                            self.first_entry_offset
-                        ),
-                    )));
-                }
-                return Some(self.checked_entry_offset(self.first_entry_offset));
+        if self.arrays.reverse
+            && let Some(offset) = self.first_entry_offset.take()
+        {
+            if let Some(previous) = self.arrays.previous_offset
+                && offset >= previous
+            {
+                self.exhausted = true;
+                return Some(Err(self.arrays.file.metadata_error(
+                    Some(offset),
+                    format!(
+                        "DATA entry offsets are not strictly increasing ({offset} >= {previous})"
+                    ),
+                )));
             }
+            return Some(self.checked_entry_offset(offset));
         }
 
         self.exhausted = true;
@@ -355,50 +344,15 @@ impl Iterator for DataEntryOffsetIter {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct EntryMeta {
-    pub(crate) file_id: [u8; 16],
-    pub(crate) entry_offset: u64,
-    pub(crate) seqnum_id: [u8; 16],
-    pub(crate) seqnum: u64,
-    pub(crate) realtime_usec: u64,
-    pub(crate) monotonic_usec: u64,
-    pub(crate) boot_id: [u8; 16],
-    pub(crate) xor_hash: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct EntryRange {
-    /// Earliest entry in the file-level journal entry array.
-    pub(crate) first: EntryMeta,
-    /// Latest entry in the file-level journal entry array.
-    pub(crate) last: EntryMeta,
-}
-
 pub(crate) struct FileEntryIter {
-    file: JournalFile,
     arrays: EntryArrayCursor,
-    exhausted: bool,
 }
 
 impl FileEntryIter {
-    pub(crate) fn new_with_seek_realtime(
-        file: JournalFile,
-        reverse: bool,
-        _since_realtime: Option<u64>,
-        _until_realtime: Option<u64>,
-    ) -> Result<Self> {
-        let descriptors = collect_entry_array_descriptors(
-            &file,
-            file.inner.header.entry_array_offset,
-            file.inner.header.n_entries,
-            false,
-        )?;
-        let arrays = EntryArrayCursor::new(file.clone(), descriptors, reverse);
+    pub(crate) fn new(file: JournalFile, reverse: bool) -> Result<Self> {
+        let index = file.committed_entry_index()?;
         Ok(Self {
-            file,
-            arrays,
-            exhausted: false,
+            arrays: EntryArrayCursor::new(file, index, reverse),
         })
     }
 
@@ -407,23 +361,9 @@ impl FileEntryIter {
         reverse: bool,
         after_entry_offset: u64,
     ) -> Result<Self> {
-        let descriptors = collect_entry_array_descriptors(
-            &file,
-            file.inner.header.entry_array_offset,
-            file.inner.header.n_entries,
-            false,
-        )?;
-        let arrays = EntryArrayCursor::new_after_offset(
-            file.clone(),
-            descriptors,
-            reverse,
-            after_entry_offset,
-        )?;
-
+        let index = file.committed_entry_index()?;
         Ok(Self {
-            file,
-            arrays,
-            exhausted: false,
+            arrays: EntryArrayCursor::new_after_offset(file, index, reverse, after_entry_offset)?,
         })
     }
 }
@@ -452,62 +392,56 @@ impl JournalFile {
             .unwrap_or(index))
     }
 
-    pub(super) fn snapshot_entry_range(&self) -> Result<EntryRange> {
-        // ENTRY_ARRAY slots and header tail hints are updated separately from n_entries.
-        // Locate the snapshotted ordinal, without reading later slots or trusting a tail hint
-        // that may still describe the previous append. Only array headers need to be traversed.
-        let mut current = self.inner.header.entry_array_offset;
-        let mut remaining = self.inner.header.n_entries;
-        let mut first = None;
-        let mut steps = 0usize;
-        while current != 0 && remaining != 0 {
-            if steps >= self.inner.config.max_object_chain_steps {
-                return Err(SdJournalError::LimitExceeded {
-                    kind: LimitKind::ObjectChainSteps,
-                    limit: u64::try_from(self.inner.config.max_object_chain_steps)
-                        .unwrap_or(u64::MAX),
-                });
-            }
-            steps += 1;
-            let layout = read_entry_array_layout(self, current)?;
-            if first.is_none() {
-                let offset = read_entry_array_item(self, current, &layout, 0)?;
-                first = Some(self.read_entry_meta(offset)?);
-            }
-            let count = u64::try_from(layout.item_count).unwrap_or(u64::MAX);
-            if remaining <= count {
-                let index = usize::try_from(remaining - 1).map_err(|_| {
-                    self.metadata_error(Some(current), "ENTRY_ARRAY index does not fit usize")
-                })?;
-                let offset = read_entry_array_item(self, current, &layout, index)?;
-                let last = self.read_entry_meta(offset)?;
-                return Ok(EntryRange {
-                    first: first.unwrap_or(last),
-                    last,
-                });
-            }
-            remaining -= count;
-            let next = layout.next_entry_array_offset;
-            if next != 0 && next <= current {
-                return Err(self.metadata_error(
-                    Some(current),
-                    format!("ENTRY_ARRAY next offset does not move forward ({next} <= {current})"),
-                ));
-            }
-            current = next;
-        }
-        Err(self.metadata_error(
-            Some(current),
-            "ENTRY_ARRAY chain contains fewer offsets than entry metadata requires",
-        ))
-    }
-
     pub(crate) fn read_entry_array_items(&self, offset: u64) -> Result<Vec<u64>> {
-        Ok(read_entry_array_object(self, offset)?.items)
+        let layout = read_entry_array_layout(self, offset)?;
+        let obj = self.read_object(offset, layout.size)?;
+        let obj = obj.as_slice();
+
+        let items_bytes = obj.get(24..).ok_or_else(|| SdJournalError::Corrupt {
+            path: Some(self.inner.path.clone()),
+            offset: Some(offset + 24),
+            reason: "missing ENTRY_ARRAY items".to_string(),
+        })?;
+
+        let mut items = Vec::with_capacity(layout.item_count);
+        for item in items_bytes.chunks_exact(layout.item_size) {
+            let offset = if layout.item_size == 4 {
+                read_u32_le(item, 0).map(u64::from)
+            } else {
+                read_u64_le(item, 0)
+            }
+            .ok_or_else(|| SdJournalError::Corrupt {
+                path: Some(self.inner.path.clone()),
+                offset: Some(offset),
+                reason: "ENTRY_ARRAY item truncated".to_string(),
+            })?;
+            items.push(offset);
+        }
+
+        while matches!(items.last(), Some(0)) {
+            items.pop();
+        }
+        if items.is_empty() {
+            return Err(self.metadata_error(Some(offset), "ENTRY_ARRAY contains no entry offsets"));
+        }
+        if items.contains(&0) {
+            return Err(self.metadata_error(
+                Some(offset),
+                "ENTRY_ARRAY contains a zero offset before its unused tail",
+            ));
+        }
+        if items.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(self.metadata_error(
+                Some(offset),
+                "ENTRY_ARRAY entry offsets are not strictly increasing",
+            ));
+        }
+
+        Ok(items)
     }
 
     pub(crate) fn read_entry_array_next_offset(&self, offset: u64) -> Result<u64> {
-        read_entry_array_next_offset(self, offset)
+        Ok(read_entry_array_layout(self, offset)?.next_entry_array_offset)
     }
 }
 
@@ -515,26 +449,10 @@ impl Iterator for FileEntryIter {
     type Item = Result<EntryMeta>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.exhausted {
-            return None;
-        }
-        match self.arrays.next() {
-            Some(Ok(entry_offset)) => Some(self.file.read_entry_meta(entry_offset)),
-            None => {
-                self.exhausted = true;
-                None
-            }
-            Some(Err(error)) => {
-                self.exhausted = true;
-                Some(Err(error))
-            }
-        }
+        self.arrays
+            .next()
+            .map(|offset| offset.and_then(|offset| self.arrays.file.read_entry_meta(offset)))
     }
-}
-
-#[derive(Debug)]
-struct EntryArrayObject {
-    items: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -571,18 +489,11 @@ fn collect_entry_array_descriptors(
     allow_online_snapshot_truncate: bool,
 ) -> Result<Vec<EntryArrayDescriptor>> {
     let mut arrays = Vec::new();
-    let mut visited = HashSet::new();
     let mut current = start;
     let mut previous_last = None;
     let mut remaining = expected_items;
 
     while current != 0 {
-        if !visited.insert(current) {
-            return Err(file.metadata_error(
-                Some(current),
-                format!("cycle detected in ENTRY_ARRAY chain at offset {current}"),
-            ));
-        }
         if arrays.len() >= file.inner.config.max_object_chain_steps {
             return Err(SdJournalError::LimitExceeded {
                 kind: LimitKind::ObjectChainSteps,
@@ -632,6 +543,7 @@ fn collect_entry_array_descriptors(
         }
 
         let next = layout.next_entry_array_offset;
+        // Strictly increasing links also exclude cycles, without a separate visited set.
         if next != 0 && next <= current {
             return Err(file.metadata_error(
                 Some(current),
@@ -779,6 +691,7 @@ fn partition_entry_array(
     after: u64,
     reverse: bool,
 ) -> Result<usize> {
+    array.validate_layout(file)?;
     let split = partition_point_result(array.used_items, |index| {
         let offset = read_entry_array_item(file, array.offset, &array.layout, index)?;
         if offset == 0 {
@@ -849,18 +762,8 @@ fn partition_point_result<E>(
     Ok(left)
 }
 
-fn read_entry_array_next_offset(file: &JournalFile, offset: u64) -> Result<u64> {
-    Ok(read_entry_array_layout(file, offset)?.next_entry_array_offset)
-}
-
 fn read_entry_array_layout(file: &JournalFile, offset: u64) -> Result<EntryArrayLayout> {
     file.validate_object_offset(offset)?;
-    if !offset.is_multiple_of(8) {
-        return Err(file.metadata_error(
-            Some(offset),
-            format!("ENTRY_ARRAY offset is not 8-byte aligned: {offset}"),
-        ));
-    }
 
     let buf = file.read_bytes(offset, 24)?;
     let oh = ObjectHeader::parse(buf.as_slice(), file.path(), offset)?;
@@ -1061,64 +964,6 @@ fn entry_array_chunk_range(
     }
 }
 
-fn read_entry_array_object(file: &JournalFile, offset: u64) -> Result<EntryArrayObject> {
-    let layout = read_entry_array_layout(file, offset)?;
-    let obj = file.read_object(offset, layout.size)?;
-    let obj = obj.as_slice();
-
-    let items_bytes = obj.get(24..).ok_or_else(|| SdJournalError::Corrupt {
-        path: Some(file.inner.path.clone()),
-        offset: Some(offset + 24),
-        reason: "missing ENTRY_ARRAY items".to_string(),
-    })?;
-
-    let mut items = Vec::with_capacity(layout.item_count);
-    if layout.item_size == 4 {
-        let mut i = 0usize;
-        while i < items_bytes.len() {
-            let off = read_u32_le(items_bytes, i).ok_or_else(|| SdJournalError::Corrupt {
-                path: Some(file.inner.path.clone()),
-                offset: Some(offset),
-                reason: "ENTRY_ARRAY item truncated".to_string(),
-            })?;
-            items.push(u64::from(off));
-            i += 4;
-        }
-    } else {
-        let mut i = 0usize;
-        while i < items_bytes.len() {
-            let off = read_u64_le(items_bytes, i).ok_or_else(|| SdJournalError::Corrupt {
-                path: Some(file.inner.path.clone()),
-                offset: Some(offset),
-                reason: "ENTRY_ARRAY item truncated".to_string(),
-            })?;
-            items.push(off);
-            i += 8;
-        }
-    }
-
-    while matches!(items.last(), Some(0)) {
-        items.pop();
-    }
-    if items.is_empty() {
-        return Err(file.metadata_error(Some(offset), "ENTRY_ARRAY contains no entry offsets"));
-    }
-    if items.contains(&0) {
-        return Err(file.metadata_error(
-            Some(offset),
-            "ENTRY_ARRAY contains a zero offset before its unused tail",
-        ));
-    }
-    if items.windows(2).any(|pair| pair[0] >= pair[1]) {
-        return Err(file.metadata_error(
-            Some(offset),
-            "ENTRY_ARRAY entry offsets are not strictly increasing",
-        ));
-    }
-
-    Ok(EntryArrayObject { items })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1163,28 +1008,266 @@ mod tests {
     }
 
     #[test]
-    fn entry_range_ignores_slots_beyond_snapshotted_n_entries() {
+    fn entry_iterator_ignores_slots_beyond_snapshotted_n_entries() {
         let (_root, file) = range_fixture(1, 2);
-        let range = file.entry_range().unwrap().unwrap();
-        assert_eq!(range.first.seqnum, 1);
-        assert_eq!(range.last.seqnum, 1);
+        for reverse in [false, true] {
+            let entries = file
+                .entry_iter(reverse)
+                .unwrap()
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].seqnum, 1);
+        }
     }
 
     #[test]
-    fn entry_range_does_not_trust_tail_hints_from_the_previous_append() {
-        let (_root, file) = range_fixture(2, 1);
-        let range = file.entry_range().unwrap().unwrap();
-        assert_eq!(range.first.seqnum, 1);
-        assert_eq!(range.last.seqnum, 2);
+    fn data_postings_emit_inline_entries_once_in_both_directions() {
+        let (_root, original) = range_fixture(2, 2);
+        let mut bytes = std::fs::read(original.path()).unwrap();
+        bytes.resize(504, 0);
+        bytes[96..104].copy_from_slice(&232u64.to_le_bytes());
+        bytes[136..144].copy_from_slice(&472u64.to_le_bytes());
+        bytes[472] = OBJECT_ENTRY_ARRAY;
+        bytes[480..488].copy_from_slice(&32u64.to_le_bytes());
+        bytes[496..504].copy_from_slice(&392u64.to_le_bytes());
+        std::fs::write(original.path(), bytes).unwrap();
+        let file =
+            JournalFile::open(original.path().to_path_buf(), &original.inner.config).unwrap();
+
+        for reverse in [false, true] {
+            for count in 0..=2 {
+                let data = DataObjectRef {
+                    n_entries: count,
+                    entry_offset: if count == 0 { 0 } else { 312 },
+                    entry_array_offset: if count == 2 { 472 } else { 0 },
+                };
+                let mut iter = file.data_entry_offsets(data, reverse).unwrap();
+                let mut expected = match count {
+                    0 => vec![],
+                    1 => vec![312],
+                    _ => vec![312, 392],
+                };
+                if reverse {
+                    expected.reverse();
+                }
+                for offset in expected {
+                    assert_eq!(iter.next().unwrap().unwrap(), offset);
+                }
+                assert!(iter.next().is_none());
+                assert!(iter.next().is_none());
+            }
+
+            let mut invalid = file
+                .data_entry_offsets(
+                    DataObjectRef {
+                        n_entries: 1,
+                        entry_offset: 320, // Aligned, but not a committed ENTRY offset.
+                        entry_array_offset: 0,
+                    },
+                    reverse,
+                )
+                .unwrap();
+            assert!(matches!(
+                invalid.next(),
+                Some(Err(SdJournalError::Transient { .. }))
+            ));
+            assert!(invalid.next().is_none());
+            assert!(invalid.next().is_none());
+        }
     }
 
     #[test]
-    fn entry_range_rejects_a_chain_shorter_than_n_entries() {
-        let (_root, file) = range_fixture(3, 2);
+    fn file_entry_iterator_preserves_entry_errors_and_stops_after_array_errors() {
+        for damaged_offset in [312, 392] {
+            let (_root, file) = range_fixture(2, 2);
+            let mut bytes = std::fs::read(file.path()).unwrap();
+            bytes[damaged_offset] = 0;
+            std::fs::write(file.path(), &bytes).unwrap();
+            for reverse in [false, true] {
+                let mut iter = file.entry_iter(reverse).unwrap();
+                let error_first = reverse == (damaged_offset == 392);
+                let healthy_seqnum = if damaged_offset == 312 { 2 } else { 1 };
+                if !error_first {
+                    assert_eq!(iter.next().unwrap().unwrap().seqnum, healthy_seqnum);
+                }
+                assert!(matches!(
+                    iter.next(),
+                    Some(Err(SdJournalError::Corrupt { .. }))
+                ));
+                if error_first {
+                    assert_eq!(iter.next().unwrap().unwrap().seqnum, healthy_seqnum);
+                }
+                assert!(iter.next().is_none());
+                assert!(iter.next().is_none());
+            }
+        }
+
+        let (_root, file) = range_fixture(2, 2);
+        let mut bytes = std::fs::read(file.path()).unwrap();
+        let mut iter = file.entry_iter(false).unwrap();
+        bytes[304..312].fill(0); // Damage the array after its constructor validated the prefix.
+        std::fs::write(file.path(), bytes).unwrap();
         assert!(matches!(
-            file.entry_range(),
-            Err(SdJournalError::Transient { .. })
+            iter.next(),
+            Some(Err(SdJournalError::Transient { .. }))
         ));
+        assert!(iter.next().is_none());
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn cached_entry_arrays_still_validate_their_headers_when_read() {
+        for corruption in ["type", "size", "backwards-link"] {
+            let (_root, file) = range_fixture(2, 2);
+            assert_eq!(file.entry_iter(false).unwrap().count(), 2);
+            let mut bytes = std::fs::read(file.path()).unwrap();
+            match corruption {
+                "type" => bytes[272] = crate::format::OBJECT_DATA,
+                "size" => bytes[280..288].copy_from_slice(&32u64.to_le_bytes()),
+                "backwards-link" => bytes[288..296].copy_from_slice(&272u64.to_le_bytes()),
+                _ => unreachable!(),
+            }
+            std::fs::write(file.path(), bytes).unwrap();
+
+            for reverse in [false, true] {
+                let mut iter = file.entry_iter(reverse).unwrap();
+                assert!(matches!(iter.next(), Some(Err(_))), "accepted {corruption}");
+                assert!(iter.next().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn data_postings_validate_the_cached_committed_array_header() {
+        for corruption in ["type", "size", "backwards-link"] {
+            let (_root, file) = range_fixture(2, 2);
+            let data = DataObjectRef {
+                n_entries: 1,
+                entry_offset: 312,
+                entry_array_offset: 0,
+            };
+            assert_eq!(
+                file.data_entry_offsets(data, false)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap(),
+                312
+            );
+            let mut bytes = std::fs::read(file.path()).unwrap();
+            match corruption {
+                "type" => bytes[272] = crate::format::OBJECT_DATA,
+                "size" => bytes[280..288].copy_from_slice(&32u64.to_le_bytes()),
+                "backwards-link" => bytes[288..296].copy_from_slice(&272u64.to_le_bytes()),
+                _ => unreachable!(),
+            }
+            std::fs::write(file.path(), bytes).unwrap();
+            for reverse in [false, true] {
+                let mut iter = file.data_entry_offsets(data, reverse).unwrap();
+                assert!(matches!(iter.next(), Some(Err(_))), "accepted {corruption}");
+                assert!(iter.next().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn cached_entry_arrays_keep_the_snapshot_when_a_writer_links_another_array() {
+        let (_root, file) = range_fixture(2, 2);
+        assert_eq!(file.entry_iter(false).unwrap().count(), 2);
+        let mut bytes = std::fs::read(file.path()).unwrap();
+        bytes.resize(584, 0);
+        for (offset, value) in [
+            (96, 312u64), // Expanded arena.
+            (136, 504),   // New tail ENTRY.
+            (152, 3),     // New committed entry count.
+            (288, 472),   // Link the previously final ENTRY_ARRAY to a new array.
+            (480, 32),    // New ENTRY_ARRAY size.
+            (496, 504),   // New ENTRY_ARRAY's entry offset.
+            (512, 80),    // New ENTRY size.
+            (520, 3),     // New ENTRY sequence number.
+        ] {
+            bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        bytes[472] = OBJECT_ENTRY_ARRAY;
+        bytes[504] = crate::format::OBJECT_ENTRY;
+        std::fs::write(file.path(), bytes).unwrap();
+
+        let newer = JournalFile::open(file.path().to_path_buf(), &file.inner.config).unwrap();
+        for reverse in [false, true] {
+            let old_entries = file
+                .entry_iter(reverse)
+                .unwrap()
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+            let new_entries = newer
+                .entry_iter(reverse)
+                .unwrap()
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(old_entries.len(), 2);
+            assert_eq!(new_entries.len(), 3);
+            assert!(old_entries.iter().all(|entry| entry.seqnum <= 2));
+        }
+    }
+
+    #[test]
+    fn entry_array_links_reject_cycles_and_backwards_offsets_without_a_visited_set() {
+        for next in [272u64, 264] {
+            let (_root, file) = range_fixture(3, 2);
+            let mut bytes = std::fs::read(file.path()).unwrap();
+            bytes[288..296].copy_from_slice(&next.to_le_bytes());
+            std::fs::write(file.path(), bytes).unwrap();
+            let error = file
+                .entry_iter(false)
+                .err()
+                .expect("reject invalid array chain");
+            assert!(matches!(
+                error,
+                SdJournalError::Transient { reason, .. }
+                    if reason.contains("next offset does not move forward")
+            ));
+        }
+    }
+
+    #[test]
+    fn entry_iterator_does_not_trust_tail_hints_from_the_previous_append() {
+        let (_root, file) = range_fixture(2, 1);
+        for reverse in [false, true] {
+            let entries = file
+                .entry_iter(reverse)
+                .unwrap()
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+            let seqnums: Vec<_> = entries.iter().map(|entry| entry.seqnum).collect();
+            assert_eq!(seqnums, if reverse { vec![2, 1] } else { vec![1, 2] });
+        }
+    }
+
+    #[test]
+    fn entry_iterator_rejects_a_chain_shorter_than_n_entries() {
+        let (_root, file) = range_fixture(3, 2);
+        for reverse in [false, true] {
+            assert!(matches!(
+                file.entry_iter(reverse),
+                Err(SdJournalError::Transient { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn entry_iterator_is_empty_when_no_entries_are_committed() {
+        let (_root, original) = range_fixture(0, 1);
+        let mut bytes = std::fs::read(original.path()).unwrap();
+        bytes[176..184].fill(0);
+        std::fs::write(original.path(), bytes).unwrap();
+        let file =
+            JournalFile::open(original.path().to_path_buf(), &original.inner.config).unwrap();
+        for reverse in [false, true] {
+            let mut iter = file.entry_iter(reverse).unwrap();
+            assert!(iter.next().is_none());
+            assert!(iter.next().is_none());
+        }
     }
 
     #[test]

@@ -16,6 +16,333 @@ use support::synthetic_journal::{
 };
 
 #[test]
+fn compound_filters_agree_between_historical_replay_and_live_delivery() {
+    for offline in [false, true] {
+        let layout = SyntheticJournalFile::new(&[
+            "alpha.service",
+            "beta.service",
+            "alpha.service",
+            "beta.service",
+            "alpha.service",
+        ]);
+        if offline {
+            let path = layout.root().join("synthetic.journal");
+            let mut bytes = fs::read(&path).unwrap();
+            bytes[16] = 0;
+            fs::write(path, bytes).unwrap();
+        }
+        let config = JournalConfig {
+            mmap_policy: MmapPolicy::Never,
+            ..live_test_config()
+        };
+        let journal = Journal::open_dir_with_config(layout.root(), config.clone()).unwrap();
+        let mut filter: sdjournal::Filter = journal.filter();
+        filter
+            .match_present("MESSAGE")
+            .or_group(|group: &mut sdjournal::OrGroupBuilder| {
+                group.match_exact("PRIORITY", b"1");
+            })
+            .or_group(|group| {
+                group.match_exact("PRIORITY", b"3");
+            })
+            .match_unit("alpha.service")
+            .match_unit_bytes(b"alpha.service")
+            .or_group(|_| {});
+        let expected = [
+            synthetic_message(7, 0, "alpha.service"),
+            synthetic_message(7, 2, "alpha.service"),
+        ];
+        let query = journal.query_with_filter(filter.clone());
+        let historical: Vec<_> = query
+            .collect_owned()
+            .unwrap()
+            .iter()
+            .map(|entry| String::from_utf8_lossy(entry.get("MESSAGE").unwrap()).into_owned())
+            .collect();
+        assert_eq!(historical, expected);
+
+        let mut live = LiveJournal::open_dir_with_config(layout.root(), config).unwrap();
+        let future = live.subscribe(filter.clone()).unwrap();
+        let mut options = SubscriptionOptions::new(filter);
+        options.since_realtime(0);
+        let replay = live.subscribe_with_options(options).unwrap();
+        let mut replayed = Vec::new();
+        for _ in 0..8 {
+            live.poll_once().unwrap();
+            drain_ready_messages(&replay, &mut replayed);
+        }
+        assert_eq!(replayed, expected);
+        assert_subscription_empty(&future);
+
+        layout.rewrite(&[
+            "alpha.service",
+            "beta.service",
+            "alpha.service",
+            "beta.service",
+            "alpha.service",
+            "beta.service",
+            "alpha.service",
+            "alpha.service",
+        ]);
+        assert_eq!(poll_until_delivered(&mut live, 2), 2);
+        let appended = synthetic_message(7, 7, "alpha.service");
+        assert_eq!(field(&recv_ready(&future), "MESSAGE"), appended);
+        assert_eq!(field(&recv_ready(&replay), "MESSAGE"), appended);
+        assert_subscription_empty(&future);
+        assert_subscription_empty(&replay);
+    }
+}
+
+#[test]
+fn subscriptions_revalidate_filters_created_with_a_larger_term_budget() {
+    let layout = SyntheticJournalFile::new(&["alpha.service"]);
+    let source = LiveJournal::open_dir_with_config(layout.root(), live_test_config()).unwrap();
+    let mut filter = source.filter();
+    filter.match_unit("alpha.service");
+
+    let config = JournalConfig {
+        max_query_terms: 2,
+        ..live_test_config()
+    };
+    let mut live = LiveJournal::open_dir_with_config(layout.root(), config).unwrap();
+    assert!(matches!(
+        live.subscribe(filter.clone()),
+        Err(sdjournal::SdJournalError::LimitExceeded {
+            kind: sdjournal::LimitKind::QueryTerms,
+            limit: 2,
+        })
+    ));
+    let mut options = SubscriptionOptions::new(filter);
+    options.since_realtime(0);
+    assert!(matches!(
+        live.subscribe_with_options(options),
+        Err(sdjournal::SdJournalError::LimitExceeded {
+            kind: sdjournal::LimitKind::QueryTerms,
+            limit: 2,
+        })
+    ));
+}
+
+#[test]
+fn reusable_filters_enforce_destination_field_name_limits_for_every_read_mode() {
+    let layout = SyntheticJournalFile::new(&["alpha.service"]);
+    let source = Journal::open_dir_with_config(layout.root(), live_test_config()).unwrap();
+    let mut filter = source.filter();
+    filter.or_group(|group| {
+        group.match_present("SYSLOG_IDENTIFIER");
+    });
+    let config = JournalConfig {
+        max_field_name_len: 16,
+        ..live_test_config()
+    };
+    let destination = Journal::open_dir_with_config(layout.root(), config.clone()).unwrap();
+    assert!(matches!(
+        destination.query_with_filter(filter.clone()).iter(),
+        Err(sdjournal::SdJournalError::InvalidQuery { .. })
+    ));
+    let mut live = LiveJournal::open_dir_with_config(layout.root(), config).unwrap();
+    assert!(matches!(
+        live.subscribe(filter.clone()),
+        Err(sdjournal::SdJournalError::InvalidQuery { .. })
+    ));
+    let mut options = SubscriptionOptions::new(filter.clone());
+    options.since_realtime(0);
+    assert!(matches!(
+        live.subscribe_with_options(options),
+        Err(sdjournal::SdJournalError::InvalidQuery { .. })
+    ));
+    assert_eq!(
+        source
+            .query_with_filter(filter)
+            .collect_owned()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn unit_helpers_enforce_field_name_limits_in_queries_and_subscriptions() {
+    let layout = SyntheticJournalFile::new(&["alpha.service"]);
+    let config = JournalConfig {
+        max_field_name_len: 13,
+        ..live_test_config()
+    };
+    let journal = Journal::open_dir_with_config(layout.root(), config.clone()).unwrap();
+    assert!(matches!(
+        journal.query().match_unit("alpha.service").iter(),
+        Err(sdjournal::SdJournalError::InvalidQuery { .. })
+    ));
+    let mut live = LiveJournal::open_dir_with_config(layout.root(), config).unwrap();
+    let mut filter = live.filter();
+    filter.match_unit("alpha.service");
+    assert!(matches!(
+        live.subscribe(filter),
+        Err(sdjournal::SdJournalError::InvalidQuery { .. })
+    ));
+}
+
+#[test]
+fn starting_cursor_errors_are_reported_before_registering_a_replay() {
+    let layout = SyntheticJournalFile::new(&["alpha.service"]);
+    let mut live = LiveJournal::open_dir_with_config(layout.root(), live_test_config()).unwrap();
+    let cursor = sdjournal::Cursor::parse("s=ffffffffffffffffffffffffffffffff;i=1").unwrap();
+    let mut options = SubscriptionOptions::new(live.filter());
+    options.after_cursor(cursor);
+    assert!(matches!(
+        live.subscribe_with_options(options),
+        Err(sdjournal::SdJournalError::NotFound)
+    ));
+    let subscription = subscribe_unit(&mut live, "alpha.service");
+    layout.rewrite(&["alpha.service", "alpha.service"]);
+    assert_eq!(poll_until_delivered(&mut live, 1), 1);
+    assert_eq!(
+        field(&recv_ready(&subscription), "MESSAGE"),
+        synthetic_message(7, 1, "alpha.service")
+    );
+}
+
+#[test]
+fn resume_rejects_a_missing_checkpoint_when_all_files_have_been_removed() {
+    let layout = SyntheticJournalFile::new(&["alpha.service"]);
+    let journal = Journal::open_dir_with_config(layout.root(), live_test_config()).unwrap();
+    let cursor = journal
+        .query()
+        .iter()
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .cursor();
+    let mut live = journal.live().unwrap();
+    fs::remove_file(layout.root().join("synthetic.journal")).unwrap();
+
+    let mut options = SubscriptionOptions::new(live.filter());
+    options.after_cursor(cursor);
+    assert!(matches!(
+        live.subscribe_with_options(options),
+        Err(sdjournal::SdJournalError::NotFound)
+    ));
+
+    let subscription = subscribe_unit(&mut live, "alpha.service");
+    write_synthetic_journal_file(&layout.root().join("later.journal"), &["alpha.service"], 9);
+    assert_eq!(poll_until_delivered(&mut live, 1), 1);
+    assert_eq!(
+        field(&recv_ready(&subscription), "MESSAGE"),
+        synthetic_message(9, 0, "alpha.service")
+    );
+}
+
+#[test]
+fn resume_rejects_a_checkpoint_absent_from_an_empty_journal_file() {
+    let layout = SyntheticJournalFile::new(&["alpha.service"]);
+    let journal = Journal::open_dir_with_config(layout.root(), live_test_config()).unwrap();
+    let cursor = journal
+        .query()
+        .iter()
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .cursor();
+    layout.rewrite::<&str>(&[]);
+    let path = layout.root().join("synthetic.journal");
+    let mut empty = fs::read(&path).unwrap();
+    empty[176..184].fill(0);
+    fs::write(path, empty).unwrap();
+
+    let mut live = LiveJournal::open_dir_with_config(layout.root(), live_test_config()).unwrap();
+    let mut options = SubscriptionOptions::new(live.filter());
+    options.after_cursor(cursor);
+    let error = live
+        .subscribe_with_options(options)
+        .err()
+        .expect("an empty journal cannot contain the checkpoint");
+    assert!(
+        matches!(error, sdjournal::SdJournalError::NotFound),
+        "{error:?}"
+    );
+
+    let mut options = SubscriptionOptions::new(live.filter());
+    options.since_realtime(0);
+    let subscription = live.subscribe_with_options(options).unwrap();
+    assert_eq!(live.poll_once().unwrap(), 0);
+    layout.rewrite(&["alpha.service"]);
+    assert_eq!(poll_until_delivered(&mut live, 1), 1);
+    assert_eq!(
+        field(&recv_ready(&subscription), "MESSAGE"),
+        synthetic_message(7, 0, "alpha.service")
+    );
+}
+
+#[test]
+fn journal_live_keeps_the_same_committed_boundary_in_both_file_access_modes() {
+    for max_open_files in [1, 64] {
+        let layout = SyntheticJournalFile::new(&["alpha.service", "alpha.service"]);
+        let path = layout.root().join("synthetic.journal");
+        write_synthetic_journal_file(&layout.root().join("other.journal"), &["beta.service"], 9);
+        let committed = fs::read(&path).unwrap();
+        let array = u64::from_le_bytes(committed[176..184].try_into().unwrap()) as usize;
+        let first = u64::from_le_bytes(committed[array + 24..array + 32].try_into().unwrap());
+        let mut pending = committed.clone();
+        pending[136..144].copy_from_slice(&first.to_le_bytes());
+        pending[152..160].copy_from_slice(&1u64.to_le_bytes());
+        fs::write(&path, pending).unwrap();
+        let journal = Journal::open_dir_with_config(
+            layout.root(),
+            JournalConfig {
+                max_open_files,
+                mmap_policy: MmapPolicy::Never,
+                ..live_test_config()
+            },
+        )
+        .unwrap();
+        // Only the header changes: the first ENTRY remains at the original committed offset.
+        fs::write(&path, committed).unwrap();
+        let mut live = journal.live().unwrap();
+        let subscription = subscribe_unit(&mut live, "alpha.service");
+        assert_eq!(poll_until_delivered(&mut live, 1), 1);
+        assert_eq!(
+            field(&recv_ready(&subscription), "MESSAGE"),
+            synthetic_message(7, 1, "alpha.service")
+        );
+        assert_subscription_empty(&subscription);
+    }
+}
+
+#[test]
+fn journal_live_discovers_files_created_before_the_watcher_started() {
+    let layout = SyntheticJournalFile::new(&["alpha.service"]);
+    let journal = Journal::open_dir_with_config(layout.root(), live_test_config()).unwrap();
+    write_synthetic_journal_file(&layout.root().join("later.journal"), &["beta.service"], 9);
+
+    let mut live = journal.live().unwrap();
+    let beta = subscribe_unit(&mut live, "beta.service");
+    assert_eq!(poll_until_delivered(&mut live, 1), 1);
+    assert_eq!(
+        field(&recv_ready(&beta), "MESSAGE"),
+        synthetic_message(9, 0, "beta.service")
+    );
+}
+
+#[test]
+fn replay_registered_during_empty_topology_receives_later_live_entries() {
+    let layout = SyntheticJournalFile::new(&["alpha.service"]);
+    let path = layout.root().join("synthetic.journal");
+    let mut live = LiveJournal::open_dir_with_config(layout.root(), live_test_config()).unwrap();
+    fs::remove_file(&path).unwrap();
+    let mut options = SubscriptionOptions::new(live.filter());
+    options.since_realtime(0);
+    let subscription = live.subscribe_with_options(options).unwrap();
+    write_synthetic_journal_file(&path, &["alpha.service"], 9);
+    assert_eq!(poll_until_delivered(&mut live, 1), 1);
+    assert_eq!(
+        field(&recv_ready(&subscription), "MESSAGE"),
+        synthetic_message(9, 0, "alpha.service")
+    );
+}
+
+#[test]
 fn shared_live_engine_dispatches_appended_entries_to_matching_subscriptions() {
     let initial_units = ["alpha.service", "beta.service"];
     let layout = SyntheticJournalFile::new(&initial_units);
@@ -60,8 +387,8 @@ fn shared_live_engine_dispatches_appended_entries_to_matching_subscriptions() {
         &synthetic_message(7, 3, "beta.service"),
     );
     assert_eq!(
-        alpha_entry.cursor().expect("alpha cursor"),
-        alpha_message_entry.cursor().expect("alpha message cursor"),
+        alpha_entry.cursor(),
+        alpha_message_entry.cursor(),
         "the same appended entry should fan out to both matching subscriptions"
     );
 
@@ -103,6 +430,70 @@ fn live_engine_initial_recheck_does_not_replay_existing_entries() {
 
     assert_eq!(live.poll_once().expect("initial live recheck"), 0);
     assert_subscription_empty(&alpha);
+}
+
+#[test]
+fn live_only_tail_checkpoints_keep_older_appends_from_a_different_stream() {
+    for from_journal in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let older = root.path().join("older.journal");
+        let newer = root.path().join("newer.journal");
+        write_synthetic_journal_file(&older, &["alpha.service"], 1);
+        write_synthetic_journal_file(&newer, &["alpha.service"], 200);
+        let mut live = if from_journal {
+            Journal::open_dir_with_config(root.path(), live_test_config())
+                .unwrap()
+                .live()
+                .unwrap()
+        } else {
+            LiveJournal::open_dir_with_config(root.path(), live_test_config()).unwrap()
+        };
+        let alpha = subscribe_unit(&mut live, "alpha.service");
+        assert_eq!(live.poll_once().unwrap(), 0);
+        assert_subscription_empty(&alpha);
+
+        write_synthetic_journal_file(&older, &["alpha.service"; 2], 1);
+        assert_eq!(poll_until_delivered(&mut live, 1), 1);
+        let entry = recv_ready(&alpha);
+        assert_entry(
+            &entry,
+            "alpha.service",
+            &synthetic_message(1, 1, "alpha.service"),
+        );
+        assert!(
+            entry.realtime_usec() < support::synthetic_journal::synthetic_realtime_usec(200, 0)
+        );
+        assert_subscription_empty(&alpha);
+    }
+}
+
+#[test]
+fn live_open_still_rejects_an_invalid_tail_entry_header() {
+    for corruption in ["wrong-type", "missing-items"] {
+        let layout = SyntheticJournalFile::new(&["alpha.service"]);
+        let path = layout.root().join("synthetic.journal");
+        let mut bytes = fs::read(&path).unwrap();
+        let tail = u64::from_le_bytes(bytes[136..144].try_into().unwrap()) as usize;
+        match corruption {
+            "wrong-type" => bytes[tail] = 0,
+            "missing-items" => bytes[tail + 8..tail + 16].copy_from_slice(&64u64.to_le_bytes()),
+            _ => unreachable!(),
+        }
+        fs::write(&path, bytes).unwrap();
+        for from_journal in [false, true] {
+            let result = if from_journal {
+                Journal::open_dir_with_config(layout.root(), live_test_config())
+                    .unwrap()
+                    .live()
+            } else {
+                LiveJournal::open_dir_with_config(layout.root(), live_test_config())
+            };
+            assert!(
+                matches!(result, Err(sdjournal::SdJournalError::Corrupt { .. })),
+                "live open accepted {corruption} (from_journal={from_journal})"
+            );
+        }
+    }
 }
 
 #[test]
@@ -194,6 +585,94 @@ fn live_engine_applies_one_batch_budget_across_modified_files() {
             synthetic_message(9, 2, "alpha.service"),
         ],
         "a newly appended entry must not be rejected by another file's later global watermark"
+    );
+}
+
+#[test]
+fn bounded_batches_do_not_starve_later_files_behind_a_continuously_appending_file() {
+    let layout = SyntheticJournalFile::new(&["alpha.service"]);
+    let later = layout.root().join("z-later.journal");
+    write_synthetic_journal_file(&later, &["beta.service"], 9);
+    let mut live = LiveJournal::open_dir_with_config(
+        layout.root(),
+        live_test_config_with_live_limits(8, 1, LiveQueueFullPolicy::Block),
+    )
+    .unwrap();
+    let alpha = subscribe_unit(&mut live, "alpha.service");
+    let beta = subscribe_unit(&mut live, "beta.service");
+    assert_eq!(live.poll_once().unwrap(), 0);
+
+    layout.rewrite(&["alpha.service"; 3]);
+    write_synthetic_journal_file(&later, &["beta.service"; 2], 9);
+    assert_eq!(live.poll_once().unwrap(), 1);
+    recv_ready(&alpha);
+
+    layout.rewrite(&["alpha.service"; 4]);
+    assert_eq!(live.poll_once().unwrap(), 1);
+    assert_eq!(
+        field(&recv_ready(&beta), "MESSAGE"),
+        synthetic_message(9, 1, "beta.service")
+    );
+    assert_subscription_empty(&alpha);
+}
+
+#[test]
+fn topology_refresh_preserves_pending_file_fairness() {
+    let layout = SyntheticJournalFile::new(&["alpha.service"]);
+    let later = layout.root().join("z-later.journal");
+    write_synthetic_journal_file(&later, &["beta.service"], 9);
+    let mut live = LiveJournal::open_dir_with_config(
+        layout.root(),
+        live_test_config_with_live_limits(8, 1, LiveQueueFullPolicy::Block),
+    )
+    .unwrap();
+    let alpha = subscribe_unit(&mut live, "alpha.service");
+    let beta = subscribe_unit(&mut live, "beta.service");
+    assert_eq!(live.poll_once().unwrap(), 0);
+
+    layout.rewrite(&["alpha.service"; 3]);
+    write_synthetic_journal_file(&later, &["beta.service"; 2], 9);
+    assert_eq!(live.poll_once().unwrap(), 1);
+    recv_ready(&alpha);
+
+    // A directory event must not reset the queue to lexical file order, giving the busy
+    // first file another turn before the already-pending later file can be read.
+    layout.rewrite(&["alpha.service"; 4]);
+    fs::create_dir(layout.root().join("topology-change")).unwrap();
+    assert_eq!(live.poll_once().unwrap(), 1);
+    assert_eq!(
+        field(&recv_ready(&beta), "MESSAGE"),
+        synthetic_message(9, 1, "beta.service")
+    );
+    assert_subscription_empty(&alpha);
+}
+
+#[test]
+fn pending_batches_still_observe_new_journal_files() {
+    let layout = SyntheticJournalFile::new(&["alpha.service"]);
+    let mut live = LiveJournal::open_dir_with_config(
+        layout.root(),
+        live_test_config_with_live_limits(8, 1, LiveQueueFullPolicy::Block),
+    )
+    .unwrap();
+    let alpha = subscribe_unit(&mut live, "alpha.service");
+    let beta = subscribe_unit(&mut live, "beta.service");
+    assert_eq!(live.poll_once().unwrap(), 0);
+    layout.rewrite(&["alpha.service"; 3]);
+    assert_eq!(live.poll_once().unwrap(), 1);
+    recv_ready(&alpha);
+
+    write_synthetic_journal_file(&layout.root().join("z-later.journal"), &["beta.service"], 9);
+    for count in [4, 5] {
+        layout.rewrite(&vec!["alpha.service"; count]);
+        assert_eq!(live.poll_once().unwrap(), 1);
+        while let Ok(item) = alpha.try_recv() {
+            item.unwrap();
+        }
+    }
+    assert_eq!(
+        field(&recv_ready(&beta), "MESSAGE"),
+        synthetic_message(9, 0, "beta.service")
     );
 }
 
@@ -332,6 +811,93 @@ fn live_engine_survives_temporarily_empty_topology() {
         "alpha.service",
         &synthetic_message(9, 0, "alpha.service"),
     );
+}
+
+#[test]
+fn live_engine_resumes_after_its_root_disappears_without_replaying_old_entries() {
+    let layout = SyntheticJournalFile::new(&["alpha.service"]);
+    let mut live = LiveJournal::open_dir_with_config(layout.root(), live_test_config()).unwrap();
+    let subscription = subscribe_unit(&mut live, "alpha.service");
+    assert_eq!(live.poll_once().unwrap(), 0);
+
+    let parked = tempfile::tempdir().unwrap();
+    let parked_root = parked.path().join("journal-root");
+    fs::rename(layout.root(), &parked_root).unwrap();
+    for _ in 0..2 {
+        assert_eq!(live.poll_once().expect("missing roots are temporary"), 0);
+        assert_subscription_empty(&subscription);
+    }
+
+    let mut resume = SubscriptionOptions::new(live.filter());
+    resume
+        .after_cursor(sdjournal::Cursor::parse("s=ffffffffffffffffffffffffffffffff;i=1").unwrap());
+    assert!(matches!(
+        live.subscribe_with_options(resume),
+        Err(sdjournal::SdJournalError::NotFound)
+    ));
+
+    let mut replay = SubscriptionOptions::new(live.filter());
+    replay.since_realtime(0);
+    let late_subscription = live.subscribe_with_options(replay).unwrap();
+    fs::rename(parked_root, layout.root()).unwrap();
+    layout.rewrite(&["alpha.service", "alpha.service"]);
+    assert_eq!(poll_until_delivered(&mut live, 2), 2);
+    for receiver in [&subscription, &late_subscription] {
+        assert_eq!(
+            field(&recv_ready(receiver), "MESSAGE"),
+            synthetic_message(7, 1, "alpha.service")
+        );
+        assert_subscription_empty(receiver);
+    }
+}
+
+#[test]
+fn one_missing_root_keeps_its_checkpoint_while_another_root_remains_healthy() {
+    let layout = SyntheticJournalFile::new(&["alpha.service"]);
+    let other = tempfile::tempdir().unwrap();
+    write_synthetic_journal_file(&other.path().join("healthy.journal"), &["beta.service"], 9);
+    let mut live = LiveJournal::open_dirs_with_config(
+        &[layout.root().to_path_buf(), other.path().to_path_buf()],
+        live_test_config(),
+    )
+    .unwrap();
+    let subscription = subscribe_unit(&mut live, "alpha.service");
+    assert_eq!(live.poll_once().unwrap(), 0);
+
+    let parked = tempfile::tempdir().unwrap();
+    let parked_root = parked.path().join("journal-root");
+    fs::rename(layout.root(), &parked_root).unwrap();
+    for _ in 0..2 {
+        assert_eq!(live.poll_once().unwrap(), 0);
+    }
+    fs::rename(parked_root, layout.root()).unwrap();
+    layout.rewrite(&["alpha.service", "alpha.service"]);
+
+    assert_eq!(poll_until_delivered(&mut live, 1), 1);
+    assert_eq!(
+        field(&recv_ready(&subscription), "MESSAGE"),
+        synthetic_message(7, 1, "alpha.service"),
+    );
+    assert_subscription_empty(&subscription);
+}
+
+#[test]
+fn live_rejects_a_channel_capacity_that_cannot_be_represented_in_memory() {
+    let layout = SyntheticJournalFile::new(&["alpha.service"]);
+    let item_size = std::mem::size_of::<sdjournal::Result<sdjournal::LiveEntry>>();
+    for capacity in [isize::MAX as usize / item_size + 1, usize::MAX] {
+        let result = LiveJournal::open_dir_with_config(
+            layout.root(),
+            JournalConfig {
+                live_channel_capacity: capacity,
+                ..live_test_config()
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(sdjournal::SdJournalError::InvalidQuery { .. })
+        ));
+    }
 }
 
 #[test]
@@ -1058,11 +1624,14 @@ fn live_engine_watches_empty_machine_id_directories() {
 #[test]
 fn dropping_tokio_receiver_releases_underlying_subscription() {
     let layout = SyntheticJournalFile::new(&["alpha.service"]);
-    let mut live = LiveJournal::open_dir_with_config(layout.root(), live_test_config())
-        .expect("open live engine");
+    let config = live_test_config();
+    let capacity = config.live_channel_capacity;
+    let mut live =
+        LiveJournal::open_dir_with_config(layout.root(), config).expect("open live engine");
     let receiver = subscribe_unit(&mut live, "alpha.service")
         .into_tokio()
-        .into_receiver();
+        .expect("start Tokio forwarding thread");
+    assert_eq!(receiver.max_capacity(), capacity);
     let (done_tx, done_rx) = mpsc::channel();
     let engine = thread::spawn(move || {
         let result = live.run();
@@ -1167,6 +1736,171 @@ fn live_replay_configured_total_entry_cap_returns_limit_error() {
         }) => assert_eq!(limit, 1),
         Ok(value) => panic!("expected replay limit error, got Ok({value})"),
         Err(err) => panic!("expected replay limit error, got {err}"),
+    }
+}
+
+#[test]
+fn replay_limit_errors_do_not_starve_healthy_live_subscriptions() {
+    let layout = SyntheticJournalFile::new(&["alpha.service", "alpha.service"]);
+    let mut config = live_test_config_with_live_limits(4, 1, LiveQueueFullPolicy::Block);
+    config.max_live_replay_entries = Some(1);
+    let mut live = LiveJournal::open_dir_with_config(layout.root(), config).unwrap();
+    let mut filter = live.filter();
+    filter.match_unit("alpha.service");
+    let mut options = SubscriptionOptions::new(filter);
+    options.since_realtime(0);
+    let replay = live.subscribe_with_options(options).unwrap();
+    let healthy = subscribe_unit(&mut live, "beta.service");
+
+    assert_eq!(live.poll_once().unwrap(), 1);
+    recv_ready(&replay);
+    layout.rewrite(&["alpha.service", "alpha.service", "beta.service"]);
+    assert_eq!(live.poll_once().unwrap(), 1);
+    recv_ready(&healthy);
+    assert!(matches!(
+        live.poll_once(),
+        Err(sdjournal::SdJournalError::LimitExceeded {
+            kind: sdjournal::LimitKind::LiveReplayEntries,
+            ..
+        })
+    ));
+
+    layout.rewrite(&[
+        "alpha.service",
+        "alpha.service",
+        "beta.service",
+        "beta.service",
+    ]);
+    for _ in 0..4 {
+        match live.poll_once() {
+            Ok(_) => {}
+            Err(sdjournal::SdJournalError::LimitExceeded {
+                kind: sdjournal::LimitKind::LiveReplayEntries,
+                ..
+            }) => {}
+            Err(error) => panic!("unexpected live error: {error}"),
+        }
+        if let Ok(entry) = healthy.try_recv() {
+            assert_entry(
+                &entry.unwrap(),
+                "beta.service",
+                &synthetic_message(7, 3, "beta.service"),
+            );
+            return;
+        }
+    }
+    panic!("a failed replay must not keep priority over ready live entries");
+}
+
+#[test]
+fn live_file_errors_do_not_starve_healthy_replay_subscriptions() {
+    let layout = SyntheticJournalFile::new(&["alpha.service"]);
+    let original = layout.root().join("synthetic.journal");
+    let mut bytes = fs::read(&original).unwrap();
+    let entry = u64::from_le_bytes(bytes[136..144].try_into().unwrap()) as usize;
+    // The replay entry has five fields; the subsequently created live file exceeds the limit.
+    bytes[entry + 8..entry + 16].copy_from_slice(&144u64.to_le_bytes());
+    fs::write(original, bytes).unwrap();
+    let mut config = live_test_config_with_live_limits(4, 1, LiveQueueFullPolicy::Block);
+    config.max_fields_per_entry = 5;
+    let mut live = LiveJournal::open_dir_with_config(layout.root(), config).unwrap();
+    let mut options = SubscriptionOptions::new(live.filter());
+    options.since_realtime(0);
+    let replay = live.subscribe_with_options(options).unwrap();
+
+    write_synthetic_journal_file(&layout.root().join("later.journal"), &["alpha.service"], 9);
+    assert!(matches!(
+        live.poll_once(),
+        Err(sdjournal::SdJournalError::LimitExceeded {
+            kind: sdjournal::LimitKind::FieldsPerEntry,
+            limit: 5,
+        })
+    ));
+    assert_eq!(
+        live.poll_once().expect("yield failed live turn to replay"),
+        1
+    );
+    assert_entry(
+        &recv_ready(&replay),
+        "alpha.service",
+        &synthetic_message(7, 0, "alpha.service"),
+    );
+}
+
+#[test]
+fn replay_snapshot_uses_the_same_healthy_copy_as_its_tail_checkpoint() {
+    for corruption in ["entry-array", "tail-entry"] {
+        let layout = SyntheticJournalFile::new(&["alpha.service"]);
+        let healthy = layout.root().join("synthetic.journal");
+        let bad_copy = layout.root().join("aaa-invalid-copy.journal");
+        let mut bytes = fs::read(&healthy).expect("read healthy journal");
+        let header_offset = match corruption {
+            "entry-array" => 176,
+            "tail-entry" => 136,
+            _ => unreachable!(),
+        };
+        let offset = u64::from_le_bytes(bytes[header_offset..header_offset + 8].try_into().unwrap())
+            as usize;
+        bytes[offset] = 0;
+        // Both physical files have the same file ID. The earlier path opens successfully,
+        // but only the healthy copy can provide a validated live-tail checkpoint.
+        fs::write(&bad_copy, bytes).expect("write untrackable copy");
+        let mut live = LiveJournal::open_dir_with_config(layout.root(), live_test_config())
+            .expect("track the healthy copy");
+        let mut options = SubscriptionOptions::new(live.filter());
+        options.since_realtime(0);
+        let replay = live
+            .subscribe_with_options(options)
+            .expect("snapshot the healthy copy");
+
+        assert_eq!(live.poll_once().expect("replay healthy snapshot"), 1);
+        assert_entry(
+            &recv_ready(&replay),
+            "alpha.service",
+            &synthetic_message(7, 0, "alpha.service"),
+        );
+        assert_subscription_empty(&replay);
+    }
+}
+
+#[test]
+fn live_replay_snapshot_obeys_a_single_open_file_budget() {
+    let root = tempfile::tempdir().unwrap();
+    for seed in 0..96u8 {
+        write_synthetic_journal_file(
+            &root.path().join(format!("{seed:03}.journal")),
+            &["alpha.service"],
+            seed,
+        );
+    }
+    let mut config = live_test_config_with_live_limits(128, 128, LiveQueueFullPolicy::Block);
+    config.max_open_files = 1;
+    config.mmap_policy = MmapPolicy::Never;
+    for from_snapshot in [false, true] {
+        let mut live = if from_snapshot {
+            Journal::open_dir_with_config(root.path(), config.clone())
+                .unwrap()
+                .live()
+                .unwrap()
+        } else {
+            LiveJournal::open_dir_with_config(root.path(), config.clone()).unwrap()
+        };
+        let mut options = SubscriptionOptions::new(live.filter());
+        options.since_realtime(0);
+        let replay = live.subscribe_with_options(options).unwrap();
+
+        // Neither journal-to-live conversion nor replay snapshot construction may retain all
+        // 96 handles, including under a smaller process-wide descriptor limit.
+        assert_eq!(live.poll_once().unwrap(), 96);
+        let mut messages = Vec::new();
+        drain_ready_messages(&replay, &mut messages);
+        assert_eq!(
+            messages,
+            (0..96u8)
+                .map(|seed| synthetic_message(seed, 0, "alpha.service"))
+                .collect::<Vec<_>>()
+        );
+        assert_subscription_empty(&replay);
     }
 }
 

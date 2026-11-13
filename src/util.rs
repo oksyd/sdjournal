@@ -9,11 +9,7 @@ pub(crate) fn checked_add_u64(a: u64, b: u64, context: &'static str) -> Result<u
 }
 
 pub(crate) fn take<const N: usize>(buf: &[u8], offset: usize) -> Option<[u8; N]> {
-    let end = offset.checked_add(N)?;
-    let slice = buf.get(offset..end)?;
-    let mut out = [0u8; N];
-    out.copy_from_slice(slice);
-    Some(out)
+    buf.get(offset..)?.first_chunk::<N>().copied()
 }
 
 pub(crate) fn read_u8(buf: &[u8], offset: usize) -> Option<u8> {
@@ -38,6 +34,7 @@ pub(crate) fn is_ascii_field_name(name: &[u8]) -> bool {
     !name.is_empty() && name.iter().all(|&b| b.is_ascii() && b != b'=' && b != 0)
 }
 
+#[cfg(test)]
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     const LUT: &[u8; 16] = b"0123456789abcdef";
     let mut out = Vec::with_capacity(bytes.len().saturating_mul(2));
@@ -45,7 +42,7 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
         out.push(LUT[(b >> 4) as usize]);
         out.push(LUT[(b & 0x0f) as usize]);
     }
-    String::from_utf8_lossy(&out).into_owned()
+    String::from_utf8_lossy_owned(out)
 }
 
 pub(crate) fn hex_decode(s: &str) -> Result<Vec<u8>> {
@@ -254,6 +251,10 @@ mod tests {
 
         assert_eq!(take::<4>(&buf, 1), Some([2, 3, 4, 5]));
         assert_eq!(take::<4>(&buf, 6), None);
+        assert_eq!(take::<4>(&buf, usize::MAX), None);
+        assert_eq!(take::<0>(&buf, buf.len()), Some([]));
+        assert_eq!(take::<0>(&buf, buf.len() + 1), None);
+        assert_eq!(take::<0>(&[], 0), Some([]));
 
         assert_eq!(read_u8(&buf, 0), Some(1));
         assert_eq!(read_u8(&buf, 99), None);
@@ -296,6 +297,20 @@ mod tests {
             }
             other => panic!("unexpected result: {other:?}"),
         }
+    }
+
+    #[test]
+    fn hex_encoding_handles_all_byte_values_and_empty_input() {
+        assert_eq!(hex_encode(&[]), "");
+        let bytes: Vec<u8> = (u8::MIN..=u8::MAX).collect();
+        let encoded = hex_encode(&bytes);
+        assert_eq!(encoded.len(), bytes.len() * 2);
+        assert!(
+            encoded
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        assert_eq!(hex_decode(&encoded).unwrap(), bytes);
     }
 
     #[test]

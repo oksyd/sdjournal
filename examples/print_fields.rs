@@ -21,7 +21,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!(
         "cursor={} realtime={} seq={}",
-        entry.cursor()?,
+        entry.cursor(),
         entry.realtime_usec(),
         entry.seqnum()
     );

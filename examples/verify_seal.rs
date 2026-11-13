@@ -1,6 +1,5 @@
 //! Verify Forward Secure Sealing for a journal set.
 
-#[cfg(feature = "verify-seal")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use sdjournal::Journal;
     use std::io::{Error as IoError, ErrorKind};
@@ -23,12 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => Journal::open_default()?,
     };
     journal.verify_seal(&verification_key)?;
-    println!("seal verification passed");
+    println!("all opened journals are sealed through their committed object tails");
 
     Ok(())
-}
-
-#[cfg(not(feature = "verify-seal"))]
-fn main() {
-    eprintln!("Build this example with `--features verify-seal`.");
 }

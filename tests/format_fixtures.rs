@@ -1,97 +1,56 @@
 use sdjournal::{EntryOwned, Journal};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-
-fn fixtures_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-}
+use std::path::Path;
 
 fn normalize_sdjournal_fields(entry: &EntryOwned) -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
-    for (k, v) in entry.iter_fields() {
-        if out.contains_key(k) {
-            continue;
-        }
-        out.insert(k.to_string(), String::from_utf8_lossy(v).into_owned());
+    let mut fields = BTreeMap::new();
+    for (name, value) in entry.iter_fields() {
+        fields
+            .entry(name.to_owned())
+            .or_insert_with(|| String::from_utf8_lossy(value).into_owned());
     }
-    out
+    fields
 }
 
 #[test]
-fn format_fixtures_are_parseable_and_stable() {
-    let root = fixtures_root();
-    if !root.is_dir() {
-        eprintln!("skipping: fixtures directory not found: {}", root.display());
-        return;
-    }
-
+#[ignore = "requires journal/ and expected.json datasets under tests/fixtures/*"]
+fn format_fixtures_are_parseable_and_stable() -> Result<(), Box<dyn std::error::Error>> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     let mut fixtures = Vec::new();
-    let rd = match std::fs::read_dir(&root) {
-        Ok(rd) => rd,
-        Err(e) => {
-            eprintln!(
-                "skipping: failed to read fixtures directory {}: {e}",
-                root.display()
-            );
-            return;
-        }
-    };
-    for entry in rd.flatten() {
-        let p = entry.path();
-        if p.is_dir() {
-            fixtures.push(p);
+    let entries = std::fs::read_dir(&root)
+        .map_err(|error| format!("cannot read fixtures {}: {error}", root.display()))?;
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            fixtures.push(entry.path());
         }
     }
+    assert!(!fixtures.is_empty(), "no fixtures under {}", root.display());
+    fixtures.sort();
 
-    if fixtures.is_empty() {
-        eprintln!("skipping: no fixtures under {}", root.display());
-        return;
-    }
-
-    for dir in fixtures {
-        let journal_dir = dir.join("journal");
-        let expected_path = dir.join("expected.json");
-
-        if !journal_dir.is_dir() {
-            eprintln!("skipping fixture (missing journal/): {}", dir.display());
-            continue;
-        }
-        if !expected_path.is_file() {
-            eprintln!(
-                "skipping fixture (missing expected.json): {}",
-                dir.display()
-            );
-            continue;
-        }
-
-        let expected_bytes =
-            std::fs::read(&expected_path).expect("failed to read fixture expected.json");
-        let expected: Vec<BTreeMap<String, String>> =
-            serde_json::from_slice(&expected_bytes).expect("failed to parse fixture expected.json");
-
-        let journal = match Journal::open_dir(&journal_dir) {
-            Ok(j) => j,
-            Err(e) => panic!(
-                "failed to open fixture journal {}: {e}",
-                journal_dir.display()
-            ),
-        };
-
-        let got: Vec<BTreeMap<String, String>> = journal
-            .query()
-            .collect_owned()
-            .expect("failed to read fixture journal entries")
-            .into_iter()
-            .map(|e| normalize_sdjournal_fields(&e))
-            .collect();
-
-        assert_eq!(
-            got,
-            expected,
-            "fixture mismatch: {}",
-            dir.file_name().unwrap_or_default().to_string_lossy()
+    for directory in fixtures {
+        let journal_directory = directory.join("journal");
+        let expected_path = directory.join("expected.json");
+        assert!(
+            std::fs::metadata(&journal_directory)?.is_dir(),
+            "fixture journal path is not a directory: {}",
+            journal_directory.display()
         );
+        let expected: Vec<BTreeMap<String, String>> =
+            serde_json::from_slice(&std::fs::read(&expected_path)?)?;
+        assert!(
+            !expected.is_empty(),
+            "fixture contains no expected entries: {}",
+            expected_path.display()
+        );
+        let journal = Journal::open_dir(&journal_directory)?;
+        let got: Vec<_> = journal
+            .query()
+            .collect_owned()?
+            .iter()
+            .map(normalize_sdjournal_fields)
+            .collect();
+        assert_eq!(got, expected, "fixture mismatch: {}", directory.display());
     }
+    Ok(())
 }

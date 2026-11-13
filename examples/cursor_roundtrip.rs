@@ -18,12 +18,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     };
     let entry = item?;
-    let cursor_string = entry.cursor()?.to_string();
+    let cursor_string = entry.cursor().to_string();
     println!("cursor={cursor_string}");
     print_entry("newest", &entry);
 
     let cursor = Cursor::parse(&cursor_string)?;
-    let mut resumed = journal.seek_cursor(&cursor)?;
+    let mut resumed = journal.seek_cursor(&cursor);
     resumed.limit(1);
 
     let mut iter = resumed.iter()?;

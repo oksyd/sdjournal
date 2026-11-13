@@ -6,7 +6,6 @@
 use sdjournal::LiveJournal;
 use std::error::Error;
 use std::io::{Error as IoError, ErrorKind};
-use std::sync::mpsc::RecvTimeoutError;
 use std::thread;
 use std::time::Duration;
 
@@ -28,26 +27,37 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         subscriptions.push((unit.clone(), subscription));
     }
 
-    let engine = thread::spawn(move || {
-        if let Err(err) = live.run() {
-            eprintln!("live engine stopped: {err}");
-        }
-    });
+    let engine = thread::spawn(move || live.run());
 
     let workers: Vec<_> = subscriptions
         .into_iter()
-        .map(|(unit, subscription)| spawn_subscription_worker(unit, subscription, args.count))
+        .map(|(unit, subscription)| {
+            thread::spawn(move || -> Result<(), Box<dyn Error + Send + Sync>> {
+                for _ in 0..args.count {
+                    let entry = subscription.recv_timeout(Duration::from_secs(30))??;
+                    let message = entry
+                        .get("MESSAGE")
+                        .map(|value| String::from_utf8_lossy(value).into_owned())
+                        .unwrap_or_else(|| "<no MESSAGE>".to_string());
+                    println!(
+                        "[{unit}] cursor={} realtime={} message={message}",
+                        entry.cursor(),
+                        entry.realtime_usec()
+                    );
+                }
+                Ok(())
+            })
+        })
         .collect();
 
-    for worker in workers {
-        worker
-            .join()
-            .map_err(|_| IoError::other("subscription worker panicked"))??;
-    }
-
+    // Join every worker before propagating any failure so all subscriptions are released.
+    let outcomes: Vec<_> = workers.into_iter().map(|worker| worker.join()).collect();
     engine
         .join()
-        .map_err(|_| IoError::other("live engine thread panicked"))?;
+        .map_err(|_| IoError::other("live engine thread panicked"))??;
+    for outcome in outcomes {
+        outcome.map_err(|_| IoError::other("subscription worker panicked"))??;
+    }
 
     Ok(())
 }
@@ -84,54 +94,4 @@ fn usage(message: &str) -> IoError {
             "{message}; usage: cargo run --example live_multi_subscriptions -- [--count N] [unit ...]"
         ),
     )
-}
-
-fn spawn_subscription_worker(
-    unit: String,
-    subscription: sdjournal::LiveSubscription,
-    count: usize,
-) -> thread::JoinHandle<Result<(), Box<dyn Error + Send + Sync>>> {
-    thread::spawn(move || {
-        for _ in 0..count {
-            let Some(entry) = recv_live_entry(&unit, &subscription)? else {
-                break;
-            };
-            print_live_entry(&unit, &entry)?;
-        }
-        Ok(())
-    })
-}
-
-fn recv_live_entry(
-    unit: &str,
-    subscription: &sdjournal::LiveSubscription,
-) -> Result<Option<sdjournal::LiveEntry>, Box<dyn Error + Send + Sync>> {
-    match subscription.recv_timeout(Duration::from_secs(30)) {
-        Ok(item) => Ok(Some(item?)),
-        Err(RecvTimeoutError::Timeout) => {
-            eprintln!("[{unit}] timed out waiting for a new entry");
-            Ok(None)
-        }
-        Err(RecvTimeoutError::Disconnected) => Err(Box::new(IoError::new(
-            ErrorKind::UnexpectedEof,
-            format!("[{unit}] subscription closed"),
-        ))),
-    }
-}
-
-fn print_live_entry(
-    unit: &str,
-    entry: &sdjournal::LiveEntry,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let msg = entry
-        .get("MESSAGE")
-        .map(|v| String::from_utf8_lossy(v).into_owned())
-        .unwrap_or_else(|| "<no MESSAGE>".to_string());
-    println!(
-        "[{unit}] cursor={} realtime={} message={}",
-        entry.cursor()?,
-        entry.realtime_usec(),
-        msg
-    );
-    Ok(())
 }

@@ -3,10 +3,10 @@
 //! This subscribes to a unit's live stream and persists a cursor checkpoint to disk. On restart,
 //! it resumes strictly after the last persisted cursor.
 
-#[cfg(target_os = "linux")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use sdjournal::{Cursor, LiveJournal, SubscriptionOptions};
-    use std::path::PathBuf;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
     use std::thread;
 
     let mut args = std::env::args().skip(1);
@@ -16,45 +16,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("sdjournal.cursor"));
 
-    let mut resume_cursor: Option<Cursor> = None;
-    match std::fs::read_to_string(&checkpoint_path) {
-        Ok(s) => {
-            let s = s.trim();
-            if !s.is_empty() {
-                resume_cursor = Some(Cursor::parse(s)?);
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+    let resume_cursor = match std::fs::read_to_string(&checkpoint_path) {
+        Ok(contents) => Some(Cursor::parse(contents.trim())?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e.into()),
-    }
+    };
+    let directory = checkpoint_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
 
     let mut live = LiveJournal::open_default()?;
     let mut filter = live.filter();
-    filter.match_exact("_SYSTEMD_UNIT", unit.as_bytes());
+    filter.match_unit(&unit);
     let mut options = SubscriptionOptions::new(filter);
     if let Some(cursor) = resume_cursor {
         options.after_cursor(cursor);
     }
 
     let subscription = live.subscribe_with_options(options)?;
-    let _engine = thread::spawn(move || {
-        let _ = live.run();
-    });
+    let engine = thread::spawn(move || live.run());
+    let consumed = (|| -> Result<(), Box<dyn std::error::Error>> {
+        loop {
+            let entry = subscription.recv()??;
+            if let Some(msg) = entry.get("MESSAGE") {
+                println!("{}", String::from_utf8_lossy(msg));
+            }
 
-    loop {
-        let entry = subscription.recv()??;
-        if let Some(msg) = entry.get("MESSAGE") {
-            println!("{}", String::from_utf8_lossy(msg));
+            // A unique temporary file in the same directory makes replacement atomic without
+            // clobbering an unrelated .tmp path. Persist the data before the rename.
+            let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+            writeln!(temporary, "{}", entry.cursor())?;
+            temporary.as_file().sync_all()?;
+            temporary.persist(&checkpoint_path)?;
+            std::fs::File::open(directory)?.sync_all()?;
         }
-
-        let cursor = entry.cursor()?.to_string();
-        let tmp = checkpoint_path.with_extension("tmp");
-        std::fs::write(&tmp, &cursor)?;
-        std::fs::rename(&tmp, &checkpoint_path)?;
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn main() {
-    eprintln!("This example only runs on Linux.");
+    })();
+    drop(subscription);
+    engine.join().map_err(|_| "live engine thread panicked")??;
+    consumed
 }

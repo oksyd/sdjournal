@@ -36,7 +36,7 @@ fn print_entry(entry: &EntryRef) {
         "realtime={} seq={} cursor={} message={}",
         entry.realtime_usec(),
         entry.seqnum(),
-        entry.cursor().map(|c| c.to_string()).unwrap_or_default(),
+        entry.cursor(),
         msg
     );
 }

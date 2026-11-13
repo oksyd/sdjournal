@@ -17,7 +17,9 @@ pub(crate) fn verify_file_seal(
 ) -> Result<()> {
     let header = file.header();
     if !header.is_sealed() {
-        return Ok(());
+        return Err(SdJournalError::Unsupported {
+            reason: format!("journal is not sealed: {}", file.path().display()),
+        });
     }
 
     let header_size = header.header_size;
@@ -72,13 +74,14 @@ pub(crate) fn verify_file_seal(
             }
 
             let realtime = read_entry_realtime(file, p, &oh)?;
-            if last_tag_realtime.is_some_and(|start| realtime < start) {
+            if let Some(start) = last_tag_realtime
+                && realtime < start
+            {
                 return Err(SdJournalError::Corrupt {
                     path: Some(file.path().to_path_buf()),
                     offset: Some(p),
                     reason: format!(
-                        "ENTRY realtime is older than the preceding TAG window ({realtime} < {})",
-                        last_tag_realtime.unwrap_or_default()
+                        "ENTRY realtime is older than the preceding TAG window ({realtime} < {start})"
                     ),
                 });
             }
@@ -161,7 +164,7 @@ pub(crate) fn verify_file_seal(
                 });
             }
 
-            fsprg.seek(tag.epoch)?;
+            fsprg.seek(tag.epoch);
             let hmac_key = fsprg.get_key(TAG_LENGTH, 0);
             let mut mac =
                 HmacSha256::new_from_slice(&hmac_key).map_err(|_| SdJournalError::Corrupt {
@@ -186,14 +189,12 @@ pub(crate) fn verify_file_seal(
                 q = checked_add_u64(q, adv, "verify-seal next object")?;
             }
 
-            let digest = mac.finalize().into_bytes();
-            if digest.as_slice() != tag.tag.as_slice() {
-                return Err(SdJournalError::Corrupt {
+            mac.verify_slice(&tag.tag)
+                .map_err(|_| SdJournalError::Corrupt {
                     path: Some(file.path().to_path_buf()),
                     offset: Some(p),
                     reason: "tag failed verification".to_string(),
-                });
-            }
+                })?;
 
             last_tag_end = checked_add_u64(p, align64(oh.size)?, "verify-seal tag end")?;
             last_tag_realtime = Some(tag_realtime);
@@ -226,29 +227,24 @@ pub(crate) fn verify_file_seal(
         });
     }
 
+    if last_tag_end != used_size {
+        return Err(SdJournalError::Unsupported {
+            reason: format!(
+                "journal contains unsealed objects after its last TAG: {}",
+                file.path().display()
+            ),
+        });
+    }
+
     Ok(())
 }
 
 fn read_object_header(file: &JournalFile, offset: u64) -> Result<ObjectHeader> {
     file.validate_object_offset(offset)?;
-    if !offset.is_multiple_of(8) {
-        return Err(SdJournalError::Corrupt {
-            path: Some(file.path().to_path_buf()),
-            offset: Some(offset),
-            reason: format!("object offset is not 8-byte aligned: {offset}"),
-        });
-    }
 
     let buf = file.read_bytes(offset, 16)?;
     let oh = ObjectHeader::parse(buf.as_slice(), file.path(), offset)?;
 
-    if oh.size < 16 {
-        return Err(SdJournalError::Corrupt {
-            path: Some(file.path().to_path_buf()),
-            offset: Some(offset),
-            reason: format!("object size too small: {}", oh.size),
-        });
-    }
     if oh.size > file.config().max_object_size_bytes {
         return Err(SdJournalError::LimitExceeded {
             kind: LimitKind::ObjectSizeBytes,
@@ -272,8 +268,8 @@ fn read_object_header(file: &JournalFile, offset: u64) -> Result<ObjectHeader> {
 }
 
 fn read_entry_realtime(file: &JournalFile, offset: u64, oh: &ObjectHeader) -> Result<u64> {
-    const ENTRY_HEADER_SIZE: u64 = 64;
-    if oh.size < ENTRY_HEADER_SIZE {
+    const ENTRY_HEADER_SIZE: usize = 64;
+    if oh.size < ENTRY_HEADER_SIZE as u64 {
         return Err(SdJournalError::Corrupt {
             path: Some(file.path().to_path_buf()),
             offset: Some(offset),
@@ -281,7 +277,7 @@ fn read_entry_realtime(file: &JournalFile, offset: u64, oh: &ObjectHeader) -> Re
         });
     }
 
-    let buf = file.read_bytes(offset, usize::try_from(ENTRY_HEADER_SIZE).unwrap_or(64))?;
+    let buf = file.read_bytes(offset, ENTRY_HEADER_SIZE)?;
     read_u64_le(buf.as_slice(), 24).ok_or_else(|| SdJournalError::Corrupt {
         path: Some(file.path().to_path_buf()),
         offset: Some(offset.saturating_add(24)),
@@ -325,26 +321,10 @@ fn hmac_put_header(file: &JournalFile, mac: &mut HmacSha256) -> Result<()> {
     let header_bytes = file.read_bytes(0, 136)?;
     let b = header_bytes.as_slice();
 
-    mac.update(b.get(0..16).ok_or_else(|| SdJournalError::Corrupt {
-        path: Some(file.path().to_path_buf()),
-        offset: Some(0),
-        reason: "header too short for sealing verification".to_string(),
-    })?);
-    mac.update(b.get(24..56).ok_or_else(|| SdJournalError::Corrupt {
-        path: Some(file.path().to_path_buf()),
-        offset: Some(24),
-        reason: "header too short for sealing verification".to_string(),
-    })?);
-    mac.update(b.get(72..96).ok_or_else(|| SdJournalError::Corrupt {
-        path: Some(file.path().to_path_buf()),
-        offset: Some(72),
-        reason: "header too short for sealing verification".to_string(),
-    })?);
-    mac.update(b.get(104..136).ok_or_else(|| SdJournalError::Corrupt {
-        path: Some(file.path().to_path_buf()),
-        offset: Some(104),
-        reason: "header too short for sealing verification".to_string(),
-    })?);
+    mac.update(&b[..16]);
+    mac.update(&b[24..56]);
+    mac.update(&b[72..96]);
+    mac.update(&b[104..136]);
 
     Ok(())
 }
@@ -446,7 +426,8 @@ fn hmac_update_range(
     let mut remaining = len;
     while remaining > 0 {
         let take_u64 = std::cmp::min(remaining, VERIFY_READ_CHUNK_SIZE as u64);
-        let take = usize::try_from(take_u64).unwrap_or(VERIFY_READ_CHUNK_SIZE);
+        // The chunk-size bound makes the conversion lossless on every target.
+        let take = take_u64 as usize;
         let buf = file.read_bytes(off, take)?;
         mac.update(buf.as_slice());
         off = checked_add_u64(off, take_u64, "verify-seal range")?;
@@ -495,18 +476,37 @@ fn read_tag_object(file: &JournalFile, offset: u64, oh: &ObjectHeader) -> Result
 }
 
 fn align64(size: u64) -> Result<u64> {
-    let added = checked_add_u64(size, 7, "align64")?;
-    Ok(added & !7u64)
+    size.checked_next_multiple_of(8)
+        .ok_or_else(|| SdJournalError::Corrupt {
+            path: None,
+            offset: None,
+            reason: format!("align64: eight-byte alignment overflows for {size}"),
+        })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{read_object_header, tag_realtime_window};
+    use super::{align64, read_object_header, tag_realtime_window};
     use crate::config::JournalConfig;
     use crate::file::JournalFile;
     use crate::format::{HEADER_SIGNATURE, HEADER_SIZE_MIN, OBJECT_FIELD, STATE_ARCHIVED};
     use crate::seal::parse_verification_key;
     use std::fs;
+
+    #[test]
+    fn object_alignment_handles_boundaries_and_overflow() {
+        for (size, expected) in [(0, 0), (1, 8), (7, 8), (8, 8), (9, 16)] {
+            assert_eq!(align64(size).unwrap(), expected);
+        }
+        let last_aligned = u64::MAX - 7;
+        assert_eq!(align64(last_aligned).unwrap(), last_aligned);
+        for size in last_aligned + 1..=u64::MAX {
+            assert!(matches!(
+                align64(size),
+                Err(crate::SdJournalError::Corrupt { .. })
+            ));
+        }
+    }
 
     fn journal_with_unaligned_field() -> (tempfile::TempDir, JournalFile) {
         const HEADER_SIZE: usize = HEADER_SIZE_MIN as usize;

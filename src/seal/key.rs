@@ -40,15 +40,15 @@ pub(crate) fn parse_verification_key(s: &str) -> Result<VerificationKey> {
     }
 
     let mut seed = [0u8; FSPRG_RECOMMENDED_SEEDLEN];
-    let mut chars = s.chars().peekable();
+    let mut chars = s.chars();
     for b in &mut seed {
-        while matches!(chars.peek(), Some('-')) {
-            chars.next();
-        }
-
-        let hi = chars.next().ok_or_else(|| SdJournalError::InvalidQuery {
-            reason: "verification key seed is too short".to_string(),
-        })?;
+        let hi =
+            chars
+                .by_ref()
+                .find(|&c| c != '-')
+                .ok_or_else(|| SdJournalError::InvalidQuery {
+                    reason: "verification key seed is too short".to_string(),
+                })?;
         let lo = chars.next().ok_or_else(|| SdJournalError::InvalidQuery {
             reason: "verification key seed is too short".to_string(),
         })?;
@@ -72,9 +72,10 @@ pub(crate) fn parse_verification_key(s: &str) -> Result<VerificationKey> {
         }
     }
 
-    let rest: String = chars.collect();
     let (start_s, interval_s) =
-        rest.split_once('-')
+        chars
+            .as_str()
+            .split_once('-')
             .ok_or_else(|| SdJournalError::InvalidQuery {
                 reason: "verification key missing 'start-interval'".to_string(),
             })?;
@@ -135,5 +136,35 @@ mod tests {
         ] {
             assert!(parse_verification_key(key).is_err(), "{key}");
         }
+    }
+
+    #[test]
+    fn verification_key_rejects_malformed_or_overflowing_components() {
+        for key in [
+            "",
+            "000102030405060708090a/1-10",
+            "000102030405060708090a0b0c/1-10",
+            "000102030405060708090a0g/1-10",
+            "000102030405060708090a0b-/1-10",
+            "0-00102030405060708090a0b/1-10",
+            "\u{00e9}00102030405060708090a0b/1-10",
+            "000102030405060708090a0b",
+            "000102030405060708090a0b/-10",
+            "000102030405060708090a0b/1-",
+            "000102030405060708090a0b/1-10-extra",
+            "000102030405060708090a0b/1-10000000000000000",
+            "000102030405060708090a0b/ffffffffffffffff-2",
+        ] {
+            assert!(parse_verification_key(key).is_err(), "{key}");
+        }
+    }
+
+    #[test]
+    fn verification_key_preserves_systemd_byte_separator_syntax() {
+        // journal_auth_load_key skips any run of '-' before each seed byte.
+        let key = parse_verification_key("--00-01--02030405060708090A0B/1-10").unwrap();
+        assert_eq!(key.seed, std::array::from_fn(|i| i as u8));
+        assert_eq!(key.start_usec, 16);
+        assert_eq!(key.interval_usec, 16);
     }
 }

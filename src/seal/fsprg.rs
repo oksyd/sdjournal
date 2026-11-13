@@ -28,8 +28,8 @@ impl FsprgParams {
         let q = genprime3mod4(half, seed, RND_GEN_Q)?;
 
         let n = &p * &q;
-        let n_bits = bit_length(&n);
-        if n_bits != secpar {
+        let n_bits = n.bits();
+        if n_bits != secpar as u64 {
             return Err(SdJournalError::Corrupt {
                 path: None,
                 offset: None,
@@ -73,9 +73,9 @@ impl<'a> FsprgState<'a> {
         }
     }
 
-    pub(super) fn seek(&mut self, goal: u64) -> Result<()> {
+    pub(super) fn seek(&mut self, goal: u64) {
         if goal == self.epoch {
-            return Ok(());
+            return;
         }
         if goal == self.epoch.saturating_add(1) {
             return self.evolve();
@@ -96,10 +96,8 @@ impl<'a> FsprgState<'a> {
             &self.params.p,
             &self.params.q,
             &self.params.inv_p_mod_q,
-        )?;
+        );
         self.epoch = goal;
-
-        Ok(())
     }
 
     pub(super) fn get_key(&self, keylen: usize, idx: u32) -> Vec<u8> {
@@ -113,10 +111,9 @@ impl<'a> FsprgState<'a> {
         out
     }
 
-    fn evolve(&mut self) -> Result<()> {
+    fn evolve(&mut self) {
         self.x = (&self.x * &self.x) % &self.params.n;
         self.epoch = self.epoch.saturating_add(1);
-        Ok(())
     }
 }
 
@@ -194,7 +191,7 @@ fn crt_compose(
     p: &BigUint,
     q: &BigUint,
     inv_p_mod_q: &BigUint,
-) -> Result<BigUint> {
+) -> BigUint {
     let xp_mod_q = xp % q;
     let mut a = if xq >= &xp_mod_q {
         xq - &xp_mod_q
@@ -206,7 +203,7 @@ fn crt_compose(
     }
 
     a = (a * inv_p_mod_q) % q;
-    Ok(p * a + xp)
+    p * a + xp
 }
 
 fn modinv(a: &BigUint, m: &BigUint) -> Option<BigUint> {
@@ -235,15 +232,6 @@ fn modinv(a: &BigUint, m: &BigUint) -> Option<BigUint> {
     }
 
     t.to_biguint()
-}
-
-fn bit_length(n: &BigUint) -> usize {
-    let bytes = n.to_bytes_be();
-    let Some((&first, rest)) = bytes.split_first() else {
-        return 0;
-    };
-    let leading = first.leading_zeros() as usize;
-    rest.len().saturating_add(1).saturating_mul(8) - leading
 }
 
 fn to_be_padded(n: &BigUint, len: usize) -> Vec<u8> {
@@ -370,7 +358,7 @@ mod tests {
         // Include forward jumps, backward jumps, repeated seeks, and a single-step evolve.
         // Sequential seeks alone take the evolve fast path and never exercise CRT seeking.
         for epoch in [0usize, 3, 1, 2, 2, 0] {
-            state.seek(epoch as u64).unwrap();
+            state.seek(epoch as u64);
             assert_eq!(state.epoch, epoch as u64);
             let key = state.get_key(32, 0);
             assert_eq!(hex_encode(&key), expected_keys[epoch], "epoch {epoch}");
@@ -410,9 +398,9 @@ mod tests {
 
         for epoch in 0..32u64 {
             if epoch > 0 {
-                a.evolve().unwrap();
+                a.evolve();
             }
-            b.seek(epoch).unwrap();
+            b.seek(epoch);
             assert_eq!(a.epoch, epoch);
             assert_eq!(b.epoch, epoch);
             assert_eq!(a.x, b.x);

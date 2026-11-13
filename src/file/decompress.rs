@@ -159,6 +159,11 @@ fn zstd_frame_sizes(src: &[u8]) -> Result<(u64, Option<u64>)> {
     let descriptor = *src
         .get(4)
         .ok_or_else(|| zstd_malformed("zstd frame descriptor is truncated"))?;
+    if descriptor & 0x08 != 0 {
+        return Err(zstd_malformed(
+            "zstd frame descriptor sets the reserved bit",
+        ));
+    }
     let single_segment = descriptor & 0x20 != 0;
     let mut pos = 5usize;
 
@@ -485,6 +490,102 @@ mod tests {
 
     #[cfg(feature = "zstd")]
     #[test]
+    fn zstd_rejects_the_reserved_descriptor_bit_in_every_frame() {
+        for prefix in [Vec::new(), zstd_fixture(b"first")] {
+            let mut invalid = zstd_fixture(b"second");
+            invalid[4] |= 0x08;
+            let mut encoded = prefix;
+            encoded.extend_from_slice(&invalid);
+            assert!(matches!(
+                decompress_zstd(&encoded, 128),
+                Err(SdJournalError::DecompressFailed {
+                    algo: CompressionAlgo::Zstd,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn zstd_ignores_the_unused_descriptor_bit() {
+        let plain = b"MESSAGE=unused descriptor bit";
+        let mut encoded = zstd_fixture(plain);
+        encoded[4] |= 0x10;
+        assert_eq!(decompress_zstd(&encoded, 128).unwrap(), plain);
+    }
+
+    #[cfg(feature = "zstd")]
+    fn zstd_small_window_block_fixture(block_type: u32, regenerated_size: u32) -> Vec<u8> {
+        let mut encoded = vec![0x28, 0xb5, 0x2f, 0xfd, 0, 0]; // A 1 KiB frame window.
+        let block_size = if block_type == 2 { 4 } else { regenerated_size };
+        let header = ((block_size << 3) | (block_type << 1) | 1).to_le_bytes();
+        encoded.extend_from_slice(&header[..3]);
+        match block_type {
+            0 => encoded.resize(encoded.len() + regenerated_size as usize, b'x'),
+            1 => encoded.push(b'x'),
+            2 => {
+                // A compressed block containing RLE literals and zero sequences.
+                assert!(regenerated_size < 4096);
+                let literals_header = ((regenerated_size << 4) | 5).to_le_bytes();
+                encoded.extend_from_slice(&literals_header[..2]);
+                encoded.extend_from_slice(&[b'x', 0]);
+            }
+            _ => unreachable!(),
+        }
+        encoded
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn zstd_enforces_the_frame_window_for_raw_and_rle_blocks() {
+        for block_type in [0, 1] {
+            let valid = zstd_small_window_block_fixture(block_type, 1024);
+            assert_eq!(decompress_zstd(&valid, 2048).unwrap(), vec![b'x'; 1024]);
+            let invalid = zstd_small_window_block_fixture(block_type, 1025);
+            assert!(matches!(
+                decompress_zstd(&invalid, 2048),
+                Err(SdJournalError::DecompressFailed {
+                    algo: CompressionAlgo::Zstd,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    #[ignore = "blocked on a ruzstd release containing PR #128 (compressed literals block limit)"]
+    fn zstd_rejects_compressed_literals_exceeding_the_frame_window() {
+        // ruzstd 0.9.1 leaves a bounded format-validation gap for leftover literals and
+        // blocks without sequences. Keep this regression until the upstream fix is released.
+        let valid = zstd_small_window_block_fixture(2, 1024);
+        assert_eq!(decompress_zstd(&valid, 2048).unwrap(), vec![b'x'; 1024]);
+        let invalid = zstd_small_window_block_fixture(2, 1025);
+        assert!(matches!(
+            decompress_zstd(&invalid, 2048),
+            Err(SdJournalError::DecompressFailed {
+                algo: CompressionAlgo::Zstd,
+                ..
+            })
+        ));
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn zstd_enforces_output_limit_for_oversized_compressed_literals() {
+        let invalid = zstd_small_window_block_fixture(2, 1025);
+        assert!(matches!(
+            decompress_zstd(&invalid, 1024),
+            Err(SdJournalError::LimitExceeded {
+                kind: LimitKind::DecompressedBytes,
+                limit: 1024,
+            })
+        ));
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
     fn zstd_decodes_concatenated_frames_and_skips_metadata_frames() {
         let first = zstd_fixture(b"first");
         let second = zstd_fixture(b"-second");
@@ -623,6 +724,117 @@ mod tests {
                 assert_eq!(algo, CompressionAlgo::Xz);
             }
             other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "xz")]
+    #[test]
+    fn xz_rejects_mismatched_block_sizes() {
+        // The block contains 17 compressed bytes and produces 13 bytes. Each
+        // replacement header has a valid CRC32 but an incorrect size field.
+        for header in [
+            [
+                0x02, 0x40, 0x10, 0x21, 0x01, 0x16, 0x00, 0x00, 0xe5, 0x11, 0x6c, 0x3c,
+            ],
+            [
+                0x02, 0x40, 0x12, 0x21, 0x01, 0x16, 0x00, 0x00, 0xee, 0xb0, 0xa4, 0x71,
+            ],
+            [
+                0x02, 0x80, 0x0c, 0x21, 0x01, 0x16, 0x00, 0x00, 0x8e, 0x4c, 0x65, 0x84,
+            ],
+            [
+                0x02, 0x80, 0x0e, 0x21, 0x01, 0x16, 0x00, 0x00, 0x85, 0xed, 0xad, 0xc9,
+            ],
+        ] {
+            let mut encoded = xz_fixture().to_vec();
+            encoded[12..24].copy_from_slice(&header);
+            assert!(matches!(
+                decompress_xz(&encoded, 128),
+                Err(SdJournalError::DecompressFailed {
+                    algo: CompressionAlgo::Xz,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[cfg(feature = "xz")]
+    #[test]
+    fn xz_rejects_mismatched_index_sizes() {
+        // The actual unpadded block size is 37 and the output size is 13.
+        // Recomputed CRC32 values isolate size validation from checksum checks.
+        for index in [
+            [0x00, 0x01, 0x24, 0x0d, 0x30, 0x28, 0xdf, 0xaf],
+            [0x00, 0x01, 0x26, 0x0d, 0xb2, 0x4a, 0xe9, 0x9d],
+            [0x00, 0x01, 0x25, 0x0c, 0xe7, 0x29, 0xc3, 0xc1],
+            [0x00, 0x01, 0x25, 0x0e, 0xcb, 0x48, 0xcd, 0x2f],
+        ] {
+            let mut encoded = xz_fixture().to_vec();
+            encoded[52..60].copy_from_slice(&index);
+            assert!(matches!(
+                decompress_xz(&encoded, 128),
+                Err(SdJournalError::DecompressFailed {
+                    algo: CompressionAlgo::Xz,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[cfg(feature = "xz")]
+    #[test]
+    fn xz_rejects_mismatched_footer_backward_size() {
+        // The index occupies eight bytes. These CRC-valid footers claim four
+        // and twelve bytes respectively.
+        for footer in [
+            [
+                0xba, 0x65, 0xaf, 0xb6, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x59, 0x5a,
+            ],
+            [
+                0xb1, 0xc4, 0x67, 0xfb, 0x02, 0x00, 0x00, 0x00, 0x00, 0x04, 0x59, 0x5a,
+            ],
+        ] {
+            let mut encoded = xz_fixture().to_vec();
+            encoded[60..72].copy_from_slice(&footer);
+            assert!(matches!(
+                decompress_xz(&encoded, 128),
+                Err(SdJournalError::DecompressFailed {
+                    algo: CompressionAlgo::Xz,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[cfg(feature = "xz")]
+    #[test]
+    fn xz_rejects_every_truncated_prefix() {
+        let encoded = xz_fixture();
+        for len in 0..encoded.len() {
+            assert!(matches!(
+                decompress_xz(&encoded[..len], 128),
+                Err(SdJournalError::DecompressFailed {
+                    algo: CompressionAlgo::Xz,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[cfg(feature = "xz")]
+    #[test]
+    fn xz_validates_checksums_at_output_limit() {
+        // Stream header, block header, block data, index, and stream footer.
+        for offset in [8, 20, 44, 56, 60] {
+            let mut encoded = xz_fixture().to_vec();
+            encoded[offset] ^= 1;
+            assert!(matches!(
+                decompress_xz(&encoded, b"hello from xz".len()),
+                Err(SdJournalError::DecompressFailed {
+                    algo: CompressionAlgo::Xz,
+                    ..
+                })
+            ));
         }
     }
 

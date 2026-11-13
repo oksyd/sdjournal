@@ -109,6 +109,7 @@ fn build_journal_bytes<S: AsRef<str>>(
     let mut current = align8(entry_array_offset + entry_array_size);
 
     let mut entries = Vec::with_capacity(units.len());
+    let mut entry_offsets = Vec::with_capacity(units.len());
     let mut data_plans = Vec::new();
 
     for (entry_idx, unit) in units.iter().enumerate() {
@@ -141,6 +142,11 @@ fn build_journal_bytes<S: AsRef<str>>(
             current = align8(current + size);
         }
 
+        // Keep existing object offsets stable when a rewrite appends more entries.
+        let entry_size = ENTRY_OBJECT_HEADER_SIZE + (field_indices.len() * ENTRY_ITEM_SIZE);
+        entry_offsets.push(u64::try_from(current).expect("entry offset fits"));
+        current = align8(current + entry_size);
+
         let realtime_usec = synthetic_realtime_usec(seed, entry_idx);
         entries.push(EntryPlan {
             seqnum: u64::try_from(entry_idx + 1).expect("entry seqnum fits"),
@@ -149,13 +155,6 @@ fn build_journal_bytes<S: AsRef<str>>(
             boot_id,
             field_indices,
         });
-    }
-
-    let mut entry_offsets = Vec::with_capacity(entries.len());
-    for entry in &entries {
-        let size = ENTRY_OBJECT_HEADER_SIZE + (entry.field_indices.len() * ENTRY_ITEM_SIZE);
-        entry_offsets.push(u64::try_from(current).expect("entry offset fits"));
-        current = align8(current + size);
     }
 
     let next_offsets: Vec<u64> = data_plans

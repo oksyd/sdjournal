@@ -19,23 +19,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     filter.match_unit(&unit);
 
     let subscription = live.subscribe(filter)?;
-    let _engine = thread::spawn(move || {
-        let _ = live.run();
-    });
-
-    for _ in 0..max_items {
-        let entry = subscription.recv()??;
-        let msg = entry
-            .get("MESSAGE")
-            .map(|v| String::from_utf8_lossy(v).into_owned())
-            .unwrap_or_else(|| "<no MESSAGE>".to_string());
-        println!(
-            "cursor={} realtime={} message={}",
-            entry.cursor()?,
-            entry.realtime_usec(),
-            msg
-        );
-    }
-
-    Ok(())
+    let engine = thread::spawn(move || live.run());
+    let consumed = (|| -> Result<(), Box<dyn Error>> {
+        for _ in 0..max_items {
+            let entry = subscription.recv()??;
+            let msg = entry
+                .get("MESSAGE")
+                .map(|v| String::from_utf8_lossy(v).into_owned())
+                .unwrap_or_else(|| "<no MESSAGE>".to_string());
+            println!(
+                "cursor={} realtime={} message={}",
+                entry.cursor(),
+                entry.realtime_usec(),
+                msg
+            );
+        }
+        Ok(())
+    })();
+    drop(subscription);
+    engine.join().map_err(|_| "live engine thread panicked")??;
+    consumed
 }

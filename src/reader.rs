@@ -1,14 +1,14 @@
 use crate::error::{Result, SdJournalError};
-#[cfg(test)]
-use crate::util::checked_add_u64;
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[cfg(feature = "mmap")]
 use memmap2::Mmap;
 
-/// A byte buffer returned by `RandomAccess`.
+/// Bytes read from a journal file.
 ///
 /// When mmap is enabled and safe to use, this may borrow from an mmap'd region.
 /// Otherwise, this owns the bytes read from the underlying file.
@@ -58,117 +58,96 @@ impl AsRef<[u8]> for ByteBuf {
     }
 }
 
-#[derive(Clone)]
-pub(crate) struct FileAccess {
-    path: PathBuf,
-    file: Arc<File>,
+/// A journal snapshot's I/O strategy. The enclosing JournalFile owns its path and bounds.
+pub(crate) enum FileAccess {
+    File(File),
+    Reopen {
+        expected_file_id: [u8; 16],
+        expected_seqnum_id: [u8; 16],
+    },
+    #[cfg(feature = "mmap")]
+    Mmap(Arc<Mmap>),
 }
 
 impl FileAccess {
-    pub(crate) fn new(path: PathBuf, file: Arc<File>) -> Self {
-        Self { path, file }
-    }
-
-    pub(crate) fn read_known_valid(&self, offset: u64, len: usize) -> Result<ByteBuf> {
-        let mut buf = vec![0u8; len];
-        if let Err(e) = read_exact_at(self.file.as_ref(), offset, &mut buf) {
-            if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                return Err(SdJournalError::Transient {
-                    path: Some(self.path.clone()),
-                    reason: format!(
-                        "file was truncated while reading (offset={offset}, len={len})"
-                    ),
-                });
+    pub(crate) fn read_known_valid(&self, path: &Path, offset: u64, len: usize) -> Result<ByteBuf> {
+        match self {
+            Self::File(file) => read_file_at(file, path, offset, len),
+            Self::Reopen {
+                expected_file_id,
+                expected_seqnum_id,
+            } => {
+                let file = open_validated(path, expected_file_id, expected_seqnum_id)?;
+                read_file_at(&file, path, offset, len)
             }
-            return Err(SdJournalError::io("read_at", Some(self.path.clone()), e));
+            #[cfg(feature = "mmap")]
+            Self::Mmap(map) => {
+                let start = usize::try_from(offset).map_err(|_| SdJournalError::Corrupt {
+                    path: Some(path.to_path_buf()),
+                    offset: Some(offset),
+                    reason: "offset out of range".to_string(),
+                })?;
+                let end = start
+                    .checked_add(len)
+                    .ok_or_else(|| SdJournalError::Corrupt {
+                        path: Some(path.to_path_buf()),
+                        offset: Some(offset),
+                        reason: "range overflow".to_string(),
+                    })?;
+                ByteBuf::from_mmap(map.clone(), start..end, path)
+            }
         }
-        Ok(ByteBuf::from_vec(buf))
     }
 
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> Result<u64> {
-        self.file
-            .metadata()
-            .map_err(|e| SdJournalError::io("metadata", Some(self.path.clone()), e))
-            .map(|m| m.len())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn read(&self, offset: u64, len: usize) -> Result<ByteBuf> {
-        let end = checked_add_u64(offset, u64::try_from(len).unwrap_or(u64::MAX), "read range")?;
-        let file_len = self.len()?;
-        if end > file_len {
-            return Err(SdJournalError::Transient {
-                path: Some(self.path.clone()),
-                reason: format!("read beyond end of file (file_len={file_len}, end={end})"),
-            });
-        }
-
-        self.read_known_valid(offset, len)
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct ReopenAccess {
-    path: PathBuf,
-    expected_file_id: [u8; 16],
-    expected_seqnum_id: [u8; 16],
-}
-
-impl ReopenAccess {
-    pub(crate) fn new(
-        path: PathBuf,
-        expected_file_id: [u8; 16],
-        expected_seqnum_id: [u8; 16],
-    ) -> Self {
-        Self {
-            path,
+    pub(crate) fn validate_identity(&self, path: &Path) -> Result<()> {
+        if let Self::Reopen {
             expected_file_id,
             expected_seqnum_id,
-        }
-    }
-
-    pub(crate) fn read_known_valid(&self, offset: u64, len: usize) -> Result<ByteBuf> {
-        let file = self.open_validated()?;
-        let mut buf = vec![0u8; len];
-        if let Err(error) = read_exact_at(&file, offset, &mut buf) {
-            return Err(read_failure(&self.path, offset, len, error));
-        }
-        Ok(ByteBuf::from_vec(buf))
-    }
-
-    pub(crate) fn validate_identity(&self) -> Result<()> {
-        self.open_validated().map(drop)
-    }
-
-    fn open_validated(&self) -> Result<File> {
-        let file = File::open(&self.path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::PermissionDenied {
-                SdJournalError::PermissionDenied {
-                    path: self.path.clone(),
-                }
-            } else {
-                SdJournalError::io("open", Some(self.path.clone()), error)
-            }
-        })?;
-
-        let mut identity = [0u8; 88];
-        if let Err(error) = read_exact_at(&file, 0, &mut identity) {
-            return Err(read_failure(&self.path, 0, identity.len(), error));
-        }
-        let file_id = identity.get(24..40);
-        let seqnum_id = identity.get(72..88);
-        if file_id != Some(self.expected_file_id.as_slice())
-            || seqnum_id != Some(self.expected_seqnum_id.as_slice())
+        } = self
         {
-            return Err(SdJournalError::Transient {
-                path: Some(self.path.clone()),
-                reason: "journal file was replaced after discovery".to_string(),
-            });
+            open_validated(path, expected_file_id, expected_seqnum_id)?;
         }
-
-        Ok(file)
+        Ok(())
     }
+}
+
+pub(crate) fn open_readonly(path: &Path) -> Result<File> {
+    File::open(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            SdJournalError::PermissionDenied {
+                path: path.to_path_buf(),
+            }
+        } else {
+            SdJournalError::io("open", Some(path.to_path_buf()), error)
+        }
+    })
+}
+
+fn open_validated(
+    path: &Path,
+    expected_file_id: &[u8; 16],
+    expected_seqnum_id: &[u8; 16],
+) -> Result<File> {
+    let file = open_readonly(path)?;
+    let mut identity = [0u8; 88];
+    if let Err(error) = read_exact_at(&file, 0, &mut identity) {
+        return Err(read_failure(path, 0, identity.len(), error));
+    }
+    if &identity[24..40] != expected_file_id || &identity[72..88] != expected_seqnum_id {
+        return Err(SdJournalError::Transient {
+            path: Some(path.to_path_buf()),
+            reason: "journal file was replaced after discovery".to_string(),
+        });
+    }
+    Ok(file)
+}
+
+pub(crate) fn read_file_at(file: &File, path: &Path, offset: u64, len: usize) -> Result<ByteBuf> {
+    let mut buf = vec![0u8; len];
+    if let Err(error) = read_exact_at(file, offset, &mut buf) {
+        return Err(read_failure(path, offset, len, error));
+    }
+    Ok(ByteBuf::from_vec(buf))
 }
 
 fn read_failure(path: &Path, offset: u64, len: usize, error: std::io::Error) -> SdJournalError {
@@ -179,68 +158,6 @@ fn read_failure(path: &Path, offset: u64, len: usize, error: std::io::Error) -> 
         }
     } else {
         SdJournalError::io("read_at", Some(path.to_path_buf()), error)
-    }
-}
-
-#[cfg(feature = "mmap")]
-#[derive(Clone)]
-pub(crate) struct MmapAccess {
-    path: PathBuf,
-    #[cfg(test)]
-    file: Arc<File>,
-    map: Arc<Mmap>,
-}
-
-#[cfg(feature = "mmap")]
-impl MmapAccess {
-    pub(crate) fn new(path: PathBuf, file: Arc<File>, map: Arc<Mmap>) -> Self {
-        #[cfg(not(test))]
-        let _ = file;
-        Self {
-            path,
-            #[cfg(test)]
-            file,
-            map,
-        }
-    }
-
-    pub(crate) fn read_known_valid(&self, offset: u64, len: usize) -> Result<ByteBuf> {
-        let start = usize::try_from(offset).map_err(|_| SdJournalError::Corrupt {
-            path: Some(self.path.clone()),
-            offset: Some(offset),
-            reason: "offset out of range".to_string(),
-        })?;
-        let end = start
-            .checked_add(len)
-            .ok_or_else(|| SdJournalError::Corrupt {
-                path: Some(self.path.clone()),
-                offset: Some(offset),
-                reason: "range overflow".to_string(),
-            })?;
-
-        ByteBuf::from_mmap(self.map.clone(), start..end, &self.path)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> Result<u64> {
-        self.file
-            .metadata()
-            .map_err(|e| SdJournalError::io("metadata", Some(self.path.clone()), e))
-            .map(|m| m.len())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn read(&self, offset: u64, len: usize) -> Result<ByteBuf> {
-        let end = checked_add_u64(offset, u64::try_from(len).unwrap_or(u64::MAX), "read range")?;
-        let file_len = self.len()?;
-        if end > file_len {
-            return Err(SdJournalError::Transient {
-                path: Some(self.path.clone()),
-                reason: format!("mmap read beyond end of file (file_len={file_len}, end={end})"),
-            });
-        }
-
-        self.read_known_valid(offset, len)
     }
 }
 
@@ -272,12 +189,7 @@ fn read_exact_at(file: &File, mut offset: u64, mut buf: &mut [u8]) -> std::io::R
 }
 
 #[cfg(not(any(unix, windows)))]
-fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
-    use std::io::{Read as _, Seek as _, SeekFrom};
-    let mut f = file.try_clone()?;
-    f.seek(SeekFrom::Start(offset))?;
-    f.read_exact(buf)
-}
+compile_error!("sdjournal requires a Unix or Windows target for positional file reads");
 
 #[cfg(test)]
 mod tests {
@@ -285,7 +197,7 @@ mod tests {
     use std::io::Write as _;
     use tempfile::tempdir;
 
-    fn temp_file(bytes: &[u8]) -> (tempfile::TempDir, PathBuf, Arc<File>) {
+    fn temp_file(bytes: &[u8]) -> (tempfile::TempDir, PathBuf, File) {
         let dir = tempdir().unwrap();
         let path = dir.path().join("reader.bin");
         {
@@ -293,7 +205,7 @@ mod tests {
             file.write_all(bytes).unwrap();
             file.sync_all().unwrap();
         }
-        let file = Arc::new(File::open(&path).unwrap());
+        let file = File::open(&path).unwrap();
         (dir, path, file)
     }
 
@@ -305,29 +217,53 @@ mod tests {
     }
 
     #[test]
-    fn file_access_reads_ranges_and_rejects_beyond_eof() {
+    fn file_access_reads_ranges_and_reports_eof() {
         let (_dir, path, file) = temp_file(b"abcdef");
-        let access = FileAccess::new(path.clone(), file);
+        let access = FileAccess::File(file);
 
-        assert_eq!(access.len().unwrap(), 6);
-        assert_eq!(access.read(1, 3).unwrap().as_slice(), b"bcd");
+        assert_eq!(
+            access.read_known_valid(&path, 1, 3).unwrap().as_slice(),
+            b"bcd"
+        );
 
-        match access.read(4, 3) {
+        match access.read_known_valid(&path, 4, 3) {
             Err(SdJournalError::Transient {
                 path: err_path,
                 reason,
             }) => {
                 assert_eq!(err_path, Some(path));
-                assert_eq!(reason, "read beyond end of file (file_len=6, end=7)");
+                assert_eq!(reason, "file was truncated while reading (offset=4, len=3)");
             }
             other => panic!("unexpected result: {other:?}"),
         }
     }
 
     #[test]
+    fn shared_file_access_reads_concurrent_ranges_independently() {
+        let bytes: Vec<_> = (0..4096u32).flat_map(u32::to_le_bytes).collect();
+        let (_dir, path, file) = temp_file(&bytes);
+        let access = FileAccess::File(file);
+        let start = std::sync::Barrier::new(4);
+
+        std::thread::scope(|scope| {
+            for worker in 0..4 {
+                let (access, path, bytes, start) = (&access, &path, &bytes, &start);
+                scope.spawn(move || {
+                    start.wait();
+                    for iteration in 0..128 {
+                        let offset = worker * 1024 + iteration * 4;
+                        let actual = access.read_known_valid(path, offset as u64, 64).unwrap();
+                        assert_eq!(actual.as_slice(), &bytes[offset..offset + 64]);
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
     fn file_access_reports_concurrent_truncation_as_transient() {
         let (_dir, path, file) = temp_file(b"abcdef");
-        let access = FileAccess::new(path.clone(), file);
+        let access = FileAccess::File(file);
         std::fs::OpenOptions::new()
             .write(true)
             .open(&path)
@@ -335,7 +271,7 @@ mod tests {
             .set_len(2)
             .unwrap();
 
-        match access.read_known_valid(0, 6) {
+        match access.read_known_valid(&path, 0, 6) {
             Err(SdJournalError::Transient {
                 path: err_path,
                 reason,
@@ -347,26 +283,85 @@ mod tests {
         }
     }
 
+    #[test]
+    fn reopen_access_validates_both_identifiers_on_every_read() {
+        for changed_offset in [24, 72] {
+            let mut identity = vec![0u8; 88];
+            identity[24..40].fill(0x11);
+            identity[72..88].fill(0x22);
+            identity.extend_from_slice(b"abcdef");
+            let (_dir, path, _file) = temp_file(&identity);
+            let access = FileAccess::Reopen {
+                expected_file_id: [0x11; 16],
+                expected_seqnum_id: [0x22; 16],
+            };
+            access.validate_identity(&path).unwrap();
+            assert_eq!(
+                access.read_known_valid(&path, 89, 3).unwrap().as_slice(),
+                b"bcd"
+            );
+
+            identity[changed_offset] ^= 1;
+            std::fs::write(&path, identity).unwrap();
+            for result in [
+                access.validate_identity(&path),
+                access.read_known_valid(&path, 89, 3).map(|_| ()),
+            ] {
+                assert!(matches!(
+                    result,
+                    Err(SdJournalError::Transient { path: actual, reason })
+                        if actual == Some(path.clone())
+                            && reason == "journal file was replaced after discovery"
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn reopen_access_reports_a_truncated_identity_without_panicking() {
+        let (_dir, path, _file) = temp_file(&[0; 87]);
+        let access = FileAccess::Reopen {
+            expected_file_id: [0; 16],
+            expected_seqnum_id: [0; 16],
+        };
+        for result in [
+            access.validate_identity(&path),
+            access.read_known_valid(&path, 0, 0).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(SdJournalError::Transient { path: actual, reason })
+                    if actual == Some(path.clone())
+                        && reason == "file was truncated while reading (offset=0, len=88)"
+            ));
+        }
+    }
+
     #[cfg(feature = "mmap")]
     #[test]
     fn mmap_access_reads_ranges_and_rejects_beyond_eof() {
         let (_dir, path, file) = temp_file(b"abcdef");
         // SAFETY: The file is opened read-only for the duration of the test and is not mutated.
-        let map = Arc::new(unsafe { memmap2::MmapOptions::new().map(file.as_ref()).unwrap() });
-        let access = MmapAccess::new(path.clone(), file, map);
+        let map = Arc::new(unsafe { memmap2::MmapOptions::new().map(&file).unwrap() });
+        let access = FileAccess::Mmap(map);
 
-        assert_eq!(access.read(2, 2).unwrap().as_slice(), b"cd");
+        let bytes = access.read_known_valid(&path, 2, 2).unwrap();
+        assert_eq!(bytes.as_slice(), b"cd");
 
-        match access.read(5, 2) {
-            Err(SdJournalError::Transient {
+        match access.read_known_valid(&path, 5, 2) {
+            Err(SdJournalError::Corrupt {
                 path: err_path,
+                offset,
                 reason,
             }) => {
+                assert_eq!(offset, None);
                 assert_eq!(err_path, Some(path));
-                assert_eq!(reason, "mmap read beyond end of file (file_len=6, end=7)");
+                assert_eq!(reason, "mmap range out of bounds");
             }
             other => panic!("unexpected result: {other:?}"),
         }
+        drop(access);
+        assert_eq!(bytes.as_slice(), b"cd");
     }
 
     #[cfg(feature = "mmap")]
@@ -374,7 +369,7 @@ mod tests {
     fn bytebuf_from_mmap_rejects_out_of_bounds_range() {
         let (_dir, path, file) = temp_file(b"abcdef");
         // SAFETY: The file is opened read-only for the duration of the test and is not mutated.
-        let map = Arc::new(unsafe { memmap2::MmapOptions::new().map(file.as_ref()).unwrap() });
+        let map = Arc::new(unsafe { memmap2::MmapOptions::new().map(&file).unwrap() });
 
         match ByteBuf::from_mmap(map, 2..99, &path) {
             Err(SdJournalError::Corrupt {

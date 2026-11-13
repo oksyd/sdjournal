@@ -150,12 +150,12 @@ fn show_cursor_resume(journal: &Journal, unit: &str) -> Result<(), Box<dyn Error
         return Ok(());
     };
     let entry = item?;
-    let cursor = entry.cursor()?;
+    let cursor = entry.cursor();
 
     println!("saved cursor={cursor}");
     print_borrowed_entry("cursor source", &entry);
 
-    let mut resumed = journal.seek_cursor(&cursor)?;
+    let mut resumed = journal.seek_cursor(&cursor);
     resumed.limit(1);
     let mut resumed_iter = resumed.iter()?;
     if let Some(item) = resumed_iter.next() {
@@ -180,16 +180,17 @@ fn follow_unit(journal: &Journal, unit: &str, limit: usize) -> Result<(), Box<dy
     let mut filter = live.filter();
     filter.match_unit(unit);
     let subscription = live.subscribe(filter)?;
-    let _engine = std::thread::spawn(move || {
-        let _ = live.run();
-    });
-
-    for _ in 0..limit {
-        let entry = subscription.recv()??;
-        print_live_entry("live", &entry);
-    }
-
-    Ok(())
+    let engine = std::thread::spawn(move || live.run());
+    let consumed = (|| -> Result<(), Box<dyn Error>> {
+        for _ in 0..limit {
+            let entry = subscription.recv()??;
+            print_live_entry("live", &entry);
+        }
+        Ok(())
+    })();
+    drop(subscription);
+    engine.join().map_err(|_| "live engine thread panicked")??;
+    consumed
 }
 
 fn print_iter(
@@ -224,7 +225,7 @@ fn print_borrowed_entry(label: &str, entry: &EntryRef) {
         entry.realtime_usec(),
         entry.seqnum(),
         unit,
-        entry.cursor().map(|c| c.to_string()).unwrap_or_default(),
+        entry.cursor(),
         msg
     );
 }
@@ -245,7 +246,7 @@ fn print_owned_entry(label: &str, entry: &EntryOwned) {
         entry.realtime_usec(),
         entry.seqnum(),
         unit,
-        entry.cursor().map(|c| c.to_string()).unwrap_or_default(),
+        entry.cursor(),
         msg
     );
 }
@@ -266,7 +267,7 @@ fn print_live_entry(label: &str, entry: &sdjournal::LiveEntry) {
         entry.realtime_usec(),
         entry.seqnum(),
         unit,
-        entry.cursor().map(|c| c.to_string()).unwrap_or_default(),
+        entry.cursor(),
         msg
     );
 }

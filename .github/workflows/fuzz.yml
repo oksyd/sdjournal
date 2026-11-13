@@ -42,7 +42,7 @@ jobs:
             ~/.cargo/git/db
             target
             fuzz/target
-          key: cargo-${{ runner.os }}-nightly-fuzz-${{ hashFiles('Cargo.toml', 'rust-toolchain.toml', 'fuzz/Cargo.toml', '.github/workflows/fuzz.yml') }}
+          key: cargo-${{ runner.os }}-nightly-fuzz-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'fuzz/Cargo.toml', 'fuzz/Cargo.lock', '.github/workflows/fuzz.yml') }}
           restore-keys: |
             cargo-${{ runner.os }}-nightly-fuzz-
 
@@ -52,5 +52,11 @@ jobs:
             cargo install cargo-fuzz --locked
           fi
 
+      - name: Check locked fuzz dependencies
+        run: cargo check --locked --manifest-path fuzz/Cargo.toml
+
       - name: Run fuzz target (short)
         run: cargo fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -max_total_time=60
+
+      - name: Verify lockfiles are unchanged
+        run: git diff --exit-code -- Cargo.lock fuzz/Cargo.lock

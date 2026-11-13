@@ -1,6 +1,5 @@
 //! Bridge one live subscription into Tokio.
 
-#[cfg(feature = "tokio")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use sdjournal::LiveJournal;
     use std::thread;
@@ -19,34 +18,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     filter.match_unit(&unit);
 
     let subscription = live.subscribe(filter)?;
-    let _engine = thread::spawn(move || {
-        let _ = live.run();
-    });
-    let mut rx = subscription.into_tokio().into_receiver();
-    for _ in 0..max_items {
-        let item = rx.blocking_recv().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "tokio live channel closed",
-            )
-        })?;
-        let entry = item?;
-        let msg = entry
-            .get("MESSAGE")
-            .map(|v| String::from_utf8_lossy(v).into_owned())
-            .unwrap_or_else(|| "<no MESSAGE>".to_string());
-        println!(
-            "cursor={} realtime={} message={}",
-            entry.cursor()?,
-            entry.realtime_usec(),
-            msg
-        );
-    }
-
-    Ok(())
-}
-
-#[cfg(not(feature = "tokio"))]
-fn main() {
-    eprintln!("Build this example with `--features tokio`.");
+    let mut rx = subscription.into_tokio()?;
+    let engine = thread::Builder::new().spawn(move || live.run())?;
+    let consumed = (|| -> Result<(), Box<dyn std::error::Error>> {
+        for _ in 0..max_items {
+            let entry = rx.blocking_recv().ok_or("tokio live channel closed")??;
+            let msg = entry
+                .get("MESSAGE")
+                .map(|v| String::from_utf8_lossy(v).into_owned())
+                .unwrap_or_else(|| "<no MESSAGE>".to_string());
+            println!(
+                "cursor={} realtime={} message={}",
+                entry.cursor(),
+                entry.realtime_usec(),
+                msg
+            );
+        }
+        Ok(())
+    })();
+    drop(rx);
+    engine.join().map_err(|_| "live engine thread panicked")??;
+    consumed
 }

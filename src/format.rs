@@ -24,21 +24,17 @@ const KNOWN_INCOMPATIBLE_FLAGS: u32 = HEADER_INCOMPATIBLE_COMPRESSED_XZ
     | HEADER_INCOMPATIBLE_COMPRESSED_ZSTD
     | HEADER_INCOMPATIBLE_COMPACT;
 
-#[allow(dead_code)]
+#[cfg(feature = "mmap")]
 pub(crate) const STATE_OFFLINE: u8 = 0;
-#[allow(dead_code)]
 pub(crate) const STATE_ONLINE: u8 = 1;
 pub(crate) const STATE_ARCHIVED: u8 = 2;
 
 pub(crate) const OBJECT_DATA: u8 = 1;
-#[cfg(feature = "verify-seal")]
 pub(crate) const OBJECT_FIELD: u8 = 2;
 pub(crate) const OBJECT_ENTRY: u8 = 3;
 pub(crate) const OBJECT_DATA_HASH_TABLE: u8 = 4;
-#[cfg(feature = "verify-seal")]
 pub(crate) const OBJECT_FIELD_HASH_TABLE: u8 = 5;
 pub(crate) const OBJECT_ENTRY_ARRAY: u8 = 6;
-#[cfg(feature = "verify-seal")]
 pub(crate) const OBJECT_TAG: u8 = 7;
 
 pub(crate) const OBJECT_COMPRESSED_XZ: u8 = 1 << 0;
@@ -46,29 +42,22 @@ pub(crate) const OBJECT_COMPRESSED_LZ4: u8 = 1 << 1;
 pub(crate) const OBJECT_COMPRESSED_ZSTD: u8 = 1 << 2;
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
+// Store only metadata used by the reader. Mutable tail hints are intentionally ignored;
+// committed entry bounds come from n_entries and the file-level ENTRY_ARRAY instead.
 pub(crate) struct Header {
+    #[cfg(any(feature = "tracing", feature = "verify-seal"))]
     pub(crate) compatible_flags: u32,
     pub(crate) incompatible_flags: u32,
     pub(crate) state: u8,
     pub(crate) file_id: [u8; 16],
-    pub(crate) machine_id: [u8; 16],
-    pub(crate) boot_id: [u8; 16],
     pub(crate) seqnum_id: [u8; 16],
     pub(crate) header_size: u64,
     pub(crate) arena_size: u64,
     pub(crate) data_hash_table_offset: u64,
     pub(crate) data_hash_table_size: u64,
-    pub(crate) field_hash_table_offset: u64,
-    pub(crate) field_hash_table_size: u64,
     pub(crate) tail_object_offset: u64,
     pub(crate) n_entries: u64,
-    pub(crate) tail_entry_seqnum: Option<u64>,
-    pub(crate) head_entry_seqnum: Option<u64>,
     pub(crate) entry_array_offset: u64,
-    pub(crate) head_entry_realtime: Option<u64>,
-    pub(crate) tail_entry_realtime: Option<u64>,
-    pub(crate) tail_entry_offset: Option<u64>,
 }
 
 impl Header {
@@ -92,6 +81,7 @@ impl Header {
             });
         }
 
+        #[cfg(any(feature = "tracing", feature = "verify-seal"))]
         let compatible_flags = read_u32_le(buf, 8).ok_or_else(|| SdJournalError::Corrupt {
             path: Some(path.to_path_buf()),
             offset: Some(8),
@@ -118,17 +108,6 @@ impl Header {
             path: Some(path.to_path_buf()),
             offset: Some(24),
             reason: "missing file_id".to_string(),
-        })?;
-        let machine_id = read_id128(buf, 40).ok_or_else(|| SdJournalError::Corrupt {
-            path: Some(path.to_path_buf()),
-            offset: Some(40),
-            reason: "missing machine_id".to_string(),
-        })?;
-
-        let boot_id = read_id128(buf, 56).ok_or_else(|| SdJournalError::Corrupt {
-            path: Some(path.to_path_buf()),
-            offset: Some(56),
-            reason: "missing boot_id".to_string(),
         })?;
         let seqnum_id = read_id128(buf, 72).ok_or_else(|| SdJournalError::Corrupt {
             path: Some(path.to_path_buf()),
@@ -165,18 +144,6 @@ impl Header {
                 offset: Some(112),
                 reason: "missing data_hash_table_size".to_string(),
             })?;
-        let field_hash_table_offset =
-            read_u64_le(buf, 120).ok_or_else(|| SdJournalError::Corrupt {
-                path: Some(path.to_path_buf()),
-                offset: Some(120),
-                reason: "missing field_hash_table_offset".to_string(),
-            })?;
-        let field_hash_table_size =
-            read_u64_le(buf, 128).ok_or_else(|| SdJournalError::Corrupt {
-                path: Some(path.to_path_buf()),
-                offset: Some(128),
-                reason: "missing field_hash_table_size".to_string(),
-            })?;
         let tail_object_offset = read_u64_le(buf, 136).ok_or_else(|| SdJournalError::Corrupt {
             path: Some(path.to_path_buf()),
             offset: Some(136),
@@ -192,36 +159,20 @@ impl Header {
             offset: Some(176),
             reason: "missing entry_array_offset".to_string(),
         })?;
-        let tail_entry_seqnum = read_u64_le(buf, 160);
-        let head_entry_seqnum = read_u64_le(buf, 168);
-        let head_entry_realtime = read_u64_le(buf, 184);
-        let tail_entry_realtime = read_u64_le(buf, 192);
-        let tail_entry_offset = (header_size >= 272)
-            .then(|| read_u64_le(buf, 264))
-            .flatten();
-
         Ok(Self {
+            #[cfg(any(feature = "tracing", feature = "verify-seal"))]
             compatible_flags,
             incompatible_flags,
             state,
             file_id,
-            machine_id,
-            boot_id,
             seqnum_id,
             header_size,
             arena_size,
             data_hash_table_offset,
             data_hash_table_size,
-            field_hash_table_offset,
-            field_hash_table_size,
             tail_object_offset,
             n_entries,
-            tail_entry_seqnum,
-            head_entry_seqnum,
             entry_array_offset,
-            head_entry_realtime,
-            tail_entry_realtime,
-            tail_entry_offset,
         })
     }
 
@@ -229,7 +180,6 @@ impl Header {
         self.incompatible_flags & HEADER_INCOMPATIBLE_COMPACT != 0
     }
 
-    #[allow(dead_code)]
     pub(crate) fn is_keyed_hash(&self) -> bool {
         self.incompatible_flags & HEADER_INCOMPATIBLE_KEYED_HASH != 0
     }
@@ -269,6 +219,32 @@ impl ObjectHeader {
             offset: Some(offset),
             reason: "object size missing".to_string(),
         })?;
+        if size < 16 {
+            return Err(SdJournalError::Corrupt {
+                path: Some(path.to_path_buf()),
+                offset: Some(offset),
+                reason: format!("object size too small: {size}"),
+            });
+        }
+        let compression_mask =
+            OBJECT_COMPRESSED_XZ | OBJECT_COMPRESSED_LZ4 | OBJECT_COMPRESSED_ZSTD;
+        if flags & compression_mask != 0
+            && matches!(
+                object_type,
+                OBJECT_FIELD
+                    | OBJECT_ENTRY
+                    | OBJECT_DATA_HASH_TABLE
+                    | OBJECT_FIELD_HASH_TABLE
+                    | OBJECT_ENTRY_ARRAY
+                    | OBJECT_TAG
+            )
+        {
+            return Err(SdJournalError::Corrupt {
+                path: Some(path.to_path_buf()),
+                offset: Some(offset),
+                reason: "compression flags are only valid on DATA objects".to_string(),
+            });
+        }
 
         Ok(Self {
             object_type,
@@ -293,110 +269,66 @@ pub(crate) fn parse_entry_data_offsets_bytes(
         });
     }
 
-    let mut data_offsets = Vec::new();
-    if compact {
-        // In compact format, each ENTRY item is 4 bytes:
-        // - object_offset: u32
-        // (the per-item hash is not stored in compact mode)
-        if !items_bytes.len().is_multiple_of(4) {
+    // Compact items store a u32 offset; regular items store a u64 offset plus a u64 hash.
+    let item_size = if compact { 4 } else { 16 };
+    if !items_bytes.len().is_multiple_of(item_size) {
+        return Err(SdJournalError::Corrupt {
+            path: Some(path.to_path_buf()),
+            offset: Some(entry_offset),
+            reason: if compact {
+                "ENTRY compact items not aligned"
+            } else {
+                "ENTRY regular items not aligned"
+            }
+            .to_string(),
+        });
+    }
+    let count = items_bytes.len() / item_size;
+    crate::util::ensure_limit_usize(LimitKind::FieldsPerEntry, max_fields_per_entry, count)?;
+
+    let mut data_offsets = Vec::with_capacity(count);
+    for (index, item) in items_bytes.chunks_exact(item_size).enumerate() {
+        let offset = if compact {
+            read_u32_le(item, 0).map(u64::from)
+        } else {
+            read_u64_le(item, 0)
+        }
+        .ok_or_else(|| SdJournalError::Corrupt {
+            path: Some(path.to_path_buf()),
+            offset: Some(entry_offset),
+            reason: if compact {
+                "ENTRY compact item truncated"
+            } else {
+                "ENTRY item truncated"
+            }
+            .to_string(),
+        })?;
+        if offset == 0 {
             return Err(SdJournalError::Corrupt {
                 path: Some(path.to_path_buf()),
-                offset: Some(entry_offset),
-                reason: "ENTRY compact items not aligned".to_string(),
+                offset: Some(entry_offset.saturating_add(64 + (index * item_size) as u64)),
+                reason: "ENTRY item has zero object offset".to_string(),
             });
         }
-        crate::util::ensure_limit_usize(
-            LimitKind::FieldsPerEntry,
-            max_fields_per_entry,
-            items_bytes.len() / 4,
-        )?;
-
-        let mut i = 0;
-        while i < items_bytes.len() {
-            let off = read_u32_le(items_bytes, i).ok_or_else(|| SdJournalError::Corrupt {
-                path: Some(path.to_path_buf()),
-                offset: Some(entry_offset),
-                reason: "ENTRY compact item truncated".to_string(),
-            })?;
-            if off == 0 {
-                return Err(SdJournalError::Corrupt {
-                    path: Some(path.to_path_buf()),
-                    offset: Some(entry_offset.saturating_add(64 + i as u64)),
-                    reason: "ENTRY item has zero object offset".to_string(),
-                });
-            }
-            data_offsets.push(u64::from(off));
-            i += 4;
-        }
-    } else {
-        // In regular format, each ENTRY item is 16 bytes:
-        // - object_offset: u64
-        // - hash: u64
-        if !items_bytes.len().is_multiple_of(16) {
-            return Err(SdJournalError::Corrupt {
-                path: Some(path.to_path_buf()),
-                offset: Some(entry_offset),
-                reason: "ENTRY regular items not aligned".to_string(),
-            });
-        }
-        crate::util::ensure_limit_usize(
-            LimitKind::FieldsPerEntry,
-            max_fields_per_entry,
-            items_bytes.len() / 16,
-        )?;
-
-        let mut i = 0;
-        while i < items_bytes.len() {
-            let object_offset =
-                read_u64_le(items_bytes, i).ok_or_else(|| SdJournalError::Corrupt {
-                    path: Some(path.to_path_buf()),
-                    offset: Some(entry_offset),
-                    reason: "ENTRY item truncated".to_string(),
-                })?;
-            if object_offset == 0 {
-                return Err(SdJournalError::Corrupt {
-                    path: Some(path.to_path_buf()),
-                    offset: Some(entry_offset.saturating_add(64 + i as u64)),
-                    reason: "ENTRY item has zero object offset".to_string(),
-                });
-            }
-            data_offsets.push(object_offset);
-            i += 16;
-        }
+        data_offsets.push(offset);
     }
 
     Ok(data_offsets)
 }
 
 pub(crate) fn compression_from_object_flags(flags: u8) -> Result<Option<CompressionAlgo>> {
-    let algo = if flags & OBJECT_COMPRESSED_XZ != 0 {
-        Some(CompressionAlgo::Xz)
-    } else if flags & OBJECT_COMPRESSED_LZ4 != 0 {
-        Some(CompressionAlgo::Lz4)
-    } else if flags & OBJECT_COMPRESSED_ZSTD != 0 {
-        Some(CompressionAlgo::Zstd)
-    } else {
-        None
-    };
-
-    let mut count = 0;
-    for bit in [
-        OBJECT_COMPRESSED_XZ,
-        OBJECT_COMPRESSED_LZ4,
-        OBJECT_COMPRESSED_ZSTD,
-    ] {
-        if flags & bit != 0 {
-            count += 1;
-        }
-    }
-    if count > 1 {
-        return Err(SdJournalError::Corrupt {
+    let mask = OBJECT_COMPRESSED_XZ | OBJECT_COMPRESSED_LZ4 | OBJECT_COMPRESSED_ZSTD;
+    match flags & mask {
+        0 => Ok(None),
+        OBJECT_COMPRESSED_XZ => Ok(Some(CompressionAlgo::Xz)),
+        OBJECT_COMPRESSED_LZ4 => Ok(Some(CompressionAlgo::Lz4)),
+        OBJECT_COMPRESSED_ZSTD => Ok(Some(CompressionAlgo::Zstd)),
+        _ => Err(SdJournalError::Corrupt {
             path: None,
             offset: None,
             reason: "multiple compression flags set".to_string(),
-        });
+        }),
     }
-    Ok(algo)
 }
 
 #[cfg(test)]
@@ -445,8 +377,6 @@ mod tests {
 
         assert_eq!(header.state, STATE_ARCHIVED);
         assert_eq!(header.file_id, [0x11; 16]);
-        assert_eq!(header.machine_id, [0x22; 16]);
-        assert_eq!(header.boot_id, [0x33; 16]);
         assert_eq!(header.seqnum_id, [0x44; 16]);
         assert_eq!(header.header_size, HEADER_SIZE_MIN);
         assert_eq!(header.n_entries, 7);
@@ -461,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn header_parse_reads_modern_entry_cutoff_fields() {
+    fn header_parse_accepts_modern_headers_without_using_mutable_tail_hints() {
         let mut buf = sample_header_bytes(0, 0);
         buf.resize(272, 0);
         buf[88..96].copy_from_slice(&272u64.to_le_bytes());
@@ -473,11 +403,10 @@ mod tests {
 
         let header = Header::parse(&buf, Path::new("dummy")).unwrap();
 
-        assert_eq!(header.tail_entry_seqnum, Some(99));
-        assert_eq!(header.head_entry_seqnum, Some(42));
-        assert_eq!(header.head_entry_realtime, Some(1_700_000_000_000_000));
-        assert_eq!(header.tail_entry_realtime, Some(1_700_000_000_000_500));
-        assert_eq!(header.tail_entry_offset, Some(4096));
+        assert_eq!(header.header_size, 272);
+        assert_eq!(header.n_entries, 7);
+        assert_eq!(header.entry_array_offset, 768);
+        assert_eq!(header.tail_object_offset, 512);
     }
 
     #[test]
@@ -488,9 +417,8 @@ mod tests {
         let header = Header::parse(&buf, Path::new("dummy")).unwrap();
 
         assert_eq!(header.header_size, HEADER_SIZE_MIN);
-        assert_eq!(header.head_entry_realtime, Some(0));
-        assert_eq!(header.tail_entry_realtime, Some(0));
-        assert_eq!(header.tail_entry_offset, None);
+        assert_eq!(header.n_entries, 7);
+        assert_eq!(header.entry_array_offset, 768);
     }
 
     #[test]
@@ -550,7 +478,84 @@ mod tests {
     }
 
     #[test]
+    fn object_header_rejects_sizes_smaller_than_its_header() {
+        for size in 0..16u64 {
+            let mut bytes = [0u8; 16];
+            bytes[0] = OBJECT_DATA;
+            bytes[8..].copy_from_slice(&size.to_le_bytes());
+            assert!(
+                matches!(
+                    ObjectHeader::parse(&bytes, Path::new("dummy"), 64),
+                    Err(SdJournalError::Corrupt {
+                        offset: Some(64),
+                        ..
+                    })
+                ),
+                "accepted object size {size}"
+            );
+        }
+    }
+
+    #[test]
+    fn object_header_rejects_compression_on_non_data_objects() {
+        for object_type in 2..=7 {
+            for flag in [
+                OBJECT_COMPRESSED_XZ,
+                OBJECT_COMPRESSED_LZ4,
+                OBJECT_COMPRESSED_ZSTD,
+            ] {
+                let mut bytes = [0u8; 16];
+                bytes[0] = object_type;
+                bytes[1] = flag;
+                bytes[8..].copy_from_slice(&64u64.to_le_bytes());
+                assert!(
+                    matches!(
+                        ObjectHeader::parse(&bytes, Path::new("dummy"), 64),
+                        Err(SdJournalError::Corrupt {
+                            offset: Some(64),
+                            ..
+                        })
+                    ),
+                    "accepted compressed object type {object_type}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn object_header_preserves_unknown_types_flags_and_reserved_bytes() {
+        for object_type in [OBJECT_DATA, OBJECT_ENTRY, 8, u8::MAX] {
+            let mut bytes = [0xff; 16];
+            bytes[0] = object_type;
+            bytes[1] = 0x80;
+            bytes[8..].copy_from_slice(&64u64.to_le_bytes());
+            let header = ObjectHeader::parse(&bytes, Path::new("dummy"), 64).unwrap();
+            assert_eq!(header.object_type, object_type);
+            assert_eq!(header.flags, 0x80);
+            assert_eq!(header.size, 64);
+        }
+    }
+
+    #[test]
     fn compression_flags_accept_single_algorithm_and_reject_conflicts() {
+        for flags in 0..=u8::MAX {
+            let bits = [
+                (OBJECT_COMPRESSED_XZ, CompressionAlgo::Xz),
+                (OBJECT_COMPRESSED_LZ4, CompressionAlgo::Lz4),
+                (OBJECT_COMPRESSED_ZSTD, CompressionAlgo::Zstd),
+            ];
+            let selected: Vec<_> = bits
+                .into_iter()
+                .filter_map(|(bit, algo)| (flags & bit != 0).then_some(algo))
+                .collect();
+            let result = compression_from_object_flags(flags);
+            match selected.as_slice() {
+                [] => assert_eq!(result.unwrap(), None),
+                [algo] => assert_eq!(result.unwrap(), Some(*algo)),
+                _ => assert!(matches!(result, Err(SdJournalError::Corrupt { .. }))),
+            }
+        }
+
         assert_eq!(compression_from_object_flags(0).unwrap(), None);
         assert_eq!(
             compression_from_object_flags(OBJECT_COMPRESSED_LZ4).unwrap(),

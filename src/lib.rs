@@ -6,7 +6,8 @@
 //! # Platform
 //!
 //! This crate parses systemd journal files. Core file parsing, queries, cursors, and compression
-//! decoding work with user-supplied `*.journal` directories on supported Rust hosts.
+//! decoding work with user-supplied `*.journal` directories on Unix and Windows hosts.
+//! Other targets are rejected at compile time because native positional file reads are required.
 //!
 //! Linux additionally supports [`Journal::open_default`] for standard system journal roots and
 //! inotify-backed live watching. On non-Linux hosts, use [`Journal::open_dir`] or
@@ -20,9 +21,9 @@
 //! - `lz4` (default): enable LZ4-compressed DATA payload decoding.
 //! - `zstd` (default): enable Zstandard-compressed DATA payload decoding.
 //! - `xz`: enable XZ-compressed DATA payload decoding.
-//! - `tokio`: enable [`LiveSubscription::into_tokio`] and [`TokioSubscription`].
+//! - `tokio`: enable `LiveSubscription::into_tokio` for a bounded Tokio receiver.
 //! - `tracing`: emit diagnostics via the `tracing` ecosystem.
-//! - `verify-seal`: enable [`Journal::verify_seal`] for Forward Secure Sealing verification.
+//! - `verify-seal`: enable `Journal::verify_seal` for Forward Secure Sealing verification.
 //!
 //! # Main Types
 //!
@@ -32,6 +33,8 @@
 //! - [`EntryOwned`] detaches an entry for storage, async use, or cross-thread transfer.
 //! - [`LiveEntry`] is the shared live-delivery wrapper used by subscriptions.
 //! - [`Cursor`] provides checkpoint and resume tokens.
+//! - [`Filter`] builds reusable predicates for historical queries and live subscriptions.
+//! - [`OrGroupBuilder`] builds alternative filter branches for historical and live queries.
 //! - [`LiveJournal`] shares one live tail engine across multiple subscriptions.
 //! - [`LiveSubscription`] receives shared live entries dispatched by the live engine.
 //!
@@ -77,7 +80,8 @@
 //! # Ok::<(), sdjournal::SdJournalError>(())
 //! ```
 
-#![deny(missing_docs, unsafe_op_in_unsafe_fn)]
+#![deny(missing_docs, raw_borrows_via_references, unsafe_op_in_unsafe_fn)]
+#![deny(clippy::undocumented_unsafe_blocks)]
 #![deny(rustdoc::broken_intra_doc_links)]
 #![cfg_attr(
     not(test),
@@ -97,6 +101,7 @@ mod cursor;
 mod entry;
 mod error;
 mod file;
+mod filter;
 mod format;
 mod journal;
 mod live;
@@ -110,10 +115,7 @@ pub use crate::config::{JournalConfig, LiveQueueFullPolicy, MmapPolicy};
 pub use crate::cursor::Cursor;
 pub use crate::entry::{EntryOwned, EntryRef, LiveEntry};
 pub use crate::error::{CompressionAlgo, LimitKind, Result, SdJournalError};
+pub use crate::filter::{Filter, OrGroupBuilder};
 pub use crate::journal::Journal;
-#[cfg(feature = "tokio")]
-pub use crate::live::TokioSubscription;
-pub use crate::live::{
-    LiveFilter, LiveJournal, LiveOrGroupBuilder, LiveSubscription, SubscriptionOptions,
-};
+pub use crate::live::{LiveJournal, LiveSubscription, SubscriptionOptions};
 pub use crate::query::JournalQuery;

@@ -40,7 +40,7 @@ fn print_entry(entry: &EntryRef) {
     println!(
         "realtime={} cursor={} message={}",
         entry.realtime_usec(),
-        entry.cursor().map(|c| c.to_string()).unwrap_or_default(),
+        entry.cursor(),
         msg
     );
 }

@@ -3,7 +3,7 @@ use std::ffi::OsStr;
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fd::OwnedFd;
@@ -92,12 +92,19 @@ impl InotifyWatcher {
 
     pub(super) fn wait(&mut self, timeout: Duration) -> WatchChange {
         let timeout = timeout.min(Duration::from_millis(i32::MAX as u64));
-        let timeout = Timespec::try_from(timeout).ok();
+        let started = Instant::now();
         let mut pfd = [PollFd::new(&self.inotify, PollFlags::IN)];
 
         loop {
+            // A signal must not restart the entire wait and indefinitely delay cancellation.
+            // The duration cap above makes both fields representable on every Linux target.
+            let remaining = timeout.saturating_sub(started.elapsed());
+            let remaining = Timespec {
+                tv_sec: remaining.as_secs() as _,
+                tv_nsec: remaining.subsec_nanos() as _,
+            };
             pfd[0].clear_revents();
-            match poll(&mut pfd, timeout.as_ref()) {
+            match poll(&mut pfd, Some(&remaining)) {
                 Ok(ready) if ready > 0 => return self.drain_ready_events(),
                 Ok(_) => {
                     return WatchChange {
@@ -105,7 +112,13 @@ impl InotifyWatcher {
                         modified_paths: Vec::new(),
                     };
                 }
-                Err(Errno::INTR) => continue,
+                Err(Errno::INTR) if started.elapsed() < timeout => continue,
+                Err(Errno::INTR) => {
+                    return WatchChange {
+                        topology_changed: false,
+                        modified_paths: Vec::new(),
+                    };
+                }
                 Err(_) => {
                     return WatchChange {
                         topology_changed: true,

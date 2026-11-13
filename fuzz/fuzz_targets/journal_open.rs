@@ -1,115 +1,119 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use std::fs::{File, OpenOptions, create_dir_all};
+use std::fs::{File, OpenOptions, create_dir};
 use std::io::{Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use tempfile::TempDir;
 
 const MAX_INPUT_SIZE: usize = 2 * 1024 * 1024;
 const HEADER_SIZE: usize = 272;
-const ENTRY_ARRAY_OFFSET: usize = HEADER_SIZE;
+const DATA_HASH_TABLE_OFFSET: usize = HEADER_SIZE;
+const ENTRY_ARRAY_OFFSET: usize = DATA_HASH_TABLE_OFFSET + 32;
+const OBJECT_DATA: u8 = 1;
 const OBJECT_ENTRY: u8 = 3;
+const OBJECT_DATA_HASH_TABLE: u8 = 4;
 const OBJECT_ENTRY_ARRAY: u8 = 6;
 const HEADER_INCOMPATIBLE_COMPACT: u32 = 1 << 4;
 const MACHINE_ID_DIR: &str = "0123456789abcdef0123456789abcdef";
+const MESSAGE: &[u8] = b"MESSAGE=hello";
+// Jenkins hash of MESSAGE=hello, used by the unkeyed DATA hash table.
+const MESSAGE_HASH: u64 = 0x87dd_eff2_fd1b_d06d;
 
 struct ReusableJournalLayout {
-    root: PathBuf,
+    root: TempDir,
     machine_dir: PathBuf,
-    root_file: Mutex<File>,
-    machine_file: Mutex<File>,
-    tilde_file: Mutex<File>,
+    root_file: File,
+    machine_file: File,
+    tilde_file: File,
 }
 
 impl ReusableJournalLayout {
-    fn new() -> Option<Self> {
-        let root =
-            std::env::temp_dir().join(format!("sdjournal-fuzz-journal-open-{}", std::process::id()));
-        create_dir_all(&root).ok()?;
+    fn new() -> Self {
+        let root = tempfile::tempdir().expect("create fuzz journal directory");
+        let machine_dir = root.path().join(MACHINE_ID_DIR);
+        create_dir(&machine_dir).expect("create fuzz machine directory");
 
-        let machine_dir = root.join(MACHINE_ID_DIR);
-        create_dir_all(&machine_dir).ok()?;
+        let root_file = open_rw(root.path().join("root.journal"));
+        let machine_file = open_rw(machine_dir.join("nested.journal"));
+        let tilde_file = open_rw(root.path().join("temp.journal~"));
 
-        let root_file = open_rw(root.join("root.journal"))?;
-        let machine_file = open_rw(machine_dir.join("nested.journal"))?;
-        let tilde_file = open_rw(root.join("temp.journal~"))?;
-
-        Some(Self {
+        Self {
             root,
             machine_dir,
-            root_file: Mutex::new(root_file),
-            machine_file: Mutex::new(machine_file),
-            tilde_file: Mutex::new(tilde_file),
-        })
+            root_file,
+            machine_file,
+            tilde_file,
+        }
     }
 
     fn root(&self) -> &Path {
-        &self.root
+        self.root.path()
     }
 
     fn machine_dir(&self) -> &Path {
         &self.machine_dir
     }
 
-    fn rewrite_all(&self, root_bytes: &[u8], machine_bytes: &[u8], tilde_bytes: &[u8]) -> bool {
-        rewrite_locked_file(&self.root_file, root_bytes)
-            && rewrite_locked_file(&self.machine_file, machine_bytes)
-            && rewrite_locked_file(&self.tilde_file, tilde_bytes)
+    fn rewrite_all(&mut self, root_bytes: &[u8], machine_bytes: &[u8], tilde_bytes: &[u8]) {
+        rewrite_file(&mut self.root_file, root_bytes);
+        rewrite_file(&mut self.machine_file, machine_bytes);
+        rewrite_file(&mut self.tilde_file, tilde_bytes);
     }
 }
 
-fn open_rw(path: PathBuf) -> Option<File> {
+fn open_rw(path: PathBuf) -> File {
     OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(true)
         .open(path)
-        .ok()
+        .expect("create fuzz journal file")
 }
 
-fn rewrite_locked_file(file: &Mutex<File>, bytes: &[u8]) -> bool {
-    let mut file = match file.lock() {
-        Ok(file) => file,
-        Err(_) => return false,
-    };
-
-    if file.rewind().is_err() {
-        return false;
-    }
-    if file.set_len(0).is_err() {
-        return false;
-    }
-    if file.write_all(bytes).is_err() {
-        return false;
-    }
-    let final_len = match u64::try_from(bytes.len()) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    if file.set_len(final_len).is_err() {
-        return false;
-    }
-
-    true
+fn rewrite_file(file: &mut File, bytes: &[u8]) {
+    file.rewind().expect("rewind fuzz journal");
+    file.write_all(bytes).expect("write fuzz journal");
+    file.set_len(bytes.len() as u64)
+        .expect("truncate fuzz journal to rewritten length");
 }
 
-fn reusable_journal_layout() -> Option<&'static ReusableJournalLayout> {
-    static SLOT: OnceLock<Option<ReusableJournalLayout>> = OnceLock::new();
-    SLOT.get_or_init(ReusableJournalLayout::new).as_ref()
+fn reusable_journal_layout() -> &'static Mutex<ReusableJournalLayout> {
+    static SLOT: OnceLock<Mutex<ReusableJournalLayout>> = OnceLock::new();
+    SLOT.get_or_init(|| {
+        let mut layout = ReusableJournalLayout::new();
+        // Cover regular/compact layouts and both indexed (offline/archived) and
+        // sequential (online) exact queries before accepting fuzz inputs.
+        for seed in [[0, 0], [1, 0], [0, 1], [1, 1], [0, 2], [1, 2]] {
+            let bytes = minimal_journal_bytes(&seed);
+            layout.rewrite_all(&bytes, &bytes, &bytes);
+            let journal = sdjournal::Journal::open_dir(layout.root())
+                .expect("normalized journal seed must open");
+            let entries = journal
+                .query()
+                .collect_owned()
+                .expect("normalized journal seed must contain a readable entry");
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].get("MESSAGE"), Some(b"hello".as_slice()));
+            let matches = journal
+                .query()
+                .match_exact("MESSAGE", b"hello")
+                .collect_owned()
+                .expect("normalized journal seed must support indexed MESSAGE queries");
+            assert_eq!(matches.len(), 1);
+        }
+        Mutex::new(layout)
+    })
 }
 
 fn write_le_u32(dst: &mut [u8], offset: usize, v: u32) {
-    if let Some(b) = dst.get_mut(offset..offset + 4) {
-        b.copy_from_slice(&v.to_le_bytes());
-    }
+    dst[offset..offset + 4].copy_from_slice(&v.to_le_bytes());
 }
 
 fn write_le_u64(dst: &mut [u8], offset: usize, v: u64) {
-    if let Some(b) = dst.get_mut(offset..offset + 8) {
-        b.copy_from_slice(&v.to_le_bytes());
-    }
+    dst[offset..offset + 8].copy_from_slice(&v.to_le_bytes());
 }
 
 fn fill_bytes(dst: &mut [u8], src: &[u8], start: usize, fallback: u8) {
@@ -152,23 +156,25 @@ fn variant_bytes(data: &[u8], salt: u8) -> Vec<u8> {
 fn minimal_journal_bytes(data: &[u8]) -> Vec<u8> {
     let compact = data.first().copied().unwrap_or(0) & 1 != 0;
     let entry_array_size = if compact { 28usize } else { 32usize };
-    let entry_offset = ENTRY_ARRAY_OFFSET.saturating_add(entry_array_size);
-    let used_size = entry_offset.saturating_add(64);
+    let data_offset = (ENTRY_ARRAY_OFFSET + entry_array_size).next_multiple_of(8);
+    let data_header_size = if compact { 72 } else { 64 };
+    let data_size = data_header_size + MESSAGE.len();
+    let entry_offset = (data_offset + data_size).next_multiple_of(8);
+    let entry_size = if compact { 68 } else { 80 };
+    let used_size = (entry_offset + entry_size).next_multiple_of(8);
+    let seqnum = load_u64(data, 96, 1);
+    let realtime = load_u64(data, 104, 1);
+    let monotonic = load_u64(data, 112, 1);
 
-    let mut bytes = data.to_vec();
-    if bytes.len() < used_size {
-        bytes.resize(used_size, 0);
-    }
+    let mut bytes = vec![0; used_size];
 
     bytes[0..8].copy_from_slice(b"LPKSHHRH");
 
-    let mut incompatible =
-        u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) & 0x1f;
-    if compact {
-        incompatible |= HEADER_INCOMPATIBLE_COMPACT;
+    let incompatible = if compact {
+        HEADER_INCOMPATIBLE_COMPACT
     } else {
-        incompatible &= !HEADER_INCOMPATIBLE_COMPACT;
-    }
+        0
+    };
     write_le_u32(&mut bytes, 12, incompatible);
     bytes[16] = data.get(1).copied().unwrap_or(0) % 3;
 
@@ -179,32 +185,54 @@ fn minimal_journal_bytes(data: &[u8]) -> Vec<u8> {
 
     write_le_u64(&mut bytes, 88, HEADER_SIZE as u64);
     write_le_u64(&mut bytes, 96, (used_size - HEADER_SIZE) as u64);
-    write_le_u64(&mut bytes, 104, 0);
-    write_le_u64(&mut bytes, 112, 0);
-    write_le_u64(&mut bytes, 120, 0);
-    write_le_u64(&mut bytes, 128, 0);
+    write_le_u64(&mut bytes, 104, (DATA_HASH_TABLE_OFFSET + 16) as u64);
+    write_le_u64(&mut bytes, 112, 16);
     write_le_u64(&mut bytes, 136, entry_offset as u64);
+    write_le_u64(&mut bytes, 144, 4);
     write_le_u64(&mut bytes, 152, 1);
+    write_le_u64(&mut bytes, 160, seqnum);
+    write_le_u64(&mut bytes, 168, seqnum);
     write_le_u64(&mut bytes, 176, ENTRY_ARRAY_OFFSET as u64);
+    write_le_u64(&mut bytes, 184, realtime);
+    write_le_u64(&mut bytes, 192, realtime);
+    write_le_u64(&mut bytes, 200, monotonic);
+    write_le_u64(&mut bytes, 208, 1);
+    write_le_u64(&mut bytes, 224, 1);
+    write_le_u64(&mut bytes, 264, entry_offset as u64);
+
+    bytes[DATA_HASH_TABLE_OFFSET] = OBJECT_DATA_HASH_TABLE;
+    write_le_u64(&mut bytes, DATA_HASH_TABLE_OFFSET + 8, 32);
+    write_le_u64(&mut bytes, DATA_HASH_TABLE_OFFSET + 16, data_offset as u64);
+    write_le_u64(&mut bytes, DATA_HASH_TABLE_OFFSET + 24, data_offset as u64);
 
     bytes[ENTRY_ARRAY_OFFSET] = OBJECT_ENTRY_ARRAY;
-    bytes[ENTRY_ARRAY_OFFSET + 1] = 0;
     write_le_u64(&mut bytes, ENTRY_ARRAY_OFFSET + 8, entry_array_size as u64);
-    write_le_u64(&mut bytes, ENTRY_ARRAY_OFFSET + 16, 0);
     if compact {
         write_le_u32(&mut bytes, ENTRY_ARRAY_OFFSET + 24, entry_offset as u32);
     } else {
         write_le_u64(&mut bytes, ENTRY_ARRAY_OFFSET + 24, entry_offset as u64);
     }
 
+    bytes[data_offset] = OBJECT_DATA;
+    write_le_u64(&mut bytes, data_offset + 8, data_size as u64);
+    write_le_u64(&mut bytes, data_offset + 16, MESSAGE_HASH);
+    write_le_u64(&mut bytes, data_offset + 40, entry_offset as u64);
+    write_le_u64(&mut bytes, data_offset + 56, 1);
+    bytes[data_offset + data_header_size..data_offset + data_size].copy_from_slice(MESSAGE);
+
     bytes[entry_offset] = OBJECT_ENTRY;
-    bytes[entry_offset + 1] = 0;
-    write_le_u64(&mut bytes, entry_offset + 8, 64);
-    write_le_u64(&mut bytes, entry_offset + 16, load_u64(data, 96, 1));
-    write_le_u64(&mut bytes, entry_offset + 24, load_u64(data, 104, 1));
-    write_le_u64(&mut bytes, entry_offset + 32, load_u64(data, 112, 1));
-    fill_bytes(&mut bytes[entry_offset + 40..entry_offset + 56], data, 120, 0x55);
-    write_le_u64(&mut bytes, entry_offset + 56, load_u64(data, 136, 0));
+    write_le_u64(&mut bytes, entry_offset + 8, entry_size as u64);
+    write_le_u64(&mut bytes, entry_offset + 16, seqnum);
+    write_le_u64(&mut bytes, entry_offset + 24, realtime);
+    write_le_u64(&mut bytes, entry_offset + 32, monotonic);
+    bytes.copy_within(56..72, entry_offset + 40);
+    write_le_u64(&mut bytes, entry_offset + 56, MESSAGE_HASH);
+    if compact {
+        write_le_u32(&mut bytes, entry_offset + 64, data_offset as u32);
+    } else {
+        write_le_u64(&mut bytes, entry_offset + 64, data_offset as u64);
+        write_le_u64(&mut bytes, entry_offset + 72, MESSAGE_HASH);
+    }
 
     bytes
 }
@@ -218,7 +246,7 @@ fn exercise_queries(journal: &sdjournal::Journal) {
 
     let mut tail = journal.query();
     tail.seek_tail().limit(8);
-    let tail_entries = tail.collect_owned().unwrap_or_default();
+    let tail_entries = tail.collect_owned();
 
     let mut bounded = journal.query();
     bounded.since_realtime(0).until_realtime(u64::MAX).limit(4);
@@ -246,13 +274,11 @@ fn exercise_queries(journal: &sdjournal::Journal) {
     or_units.limit(4);
     let _ = or_units.collect_owned();
 
-    if let Some(first) = tail_entries.first()
-        && let Ok(cursor) = first.cursor()
+    if let Ok(tail_entries) = tail_entries
+        && let Some(first) = tail_entries.first()
     {
-        let _ = journal.seek_cursor(&cursor).and_then(|mut q| {
-            q.limit(2);
-            q.collect_owned()
-        });
+        let cursor = first.cursor();
+        let _ = journal.seek_cursor(&cursor).limit(2).collect_owned();
 
         let mut after = journal.query();
         after.after_cursor(cursor).limit(2);
@@ -295,19 +321,22 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
 
-    let layout = match reusable_journal_layout() {
-        Some(layout) => layout,
-        None => return,
-    };
+    let mut layout = reusable_journal_layout()
+        .lock()
+        .expect("lock fuzz journal layout");
+
+    // Keep arbitrary inputs intact: normalization must not hide malformed headers,
+    // object offsets, compressed payloads, or inconsistent index structures.
+    layout.rewrite_all(data, data, data);
+    exercise_open_paths(&layout, false);
+    exercise_open_paths(&layout, true);
 
     let root_bytes = minimal_journal_bytes(data);
     let machine_bytes = minimal_journal_bytes(&variant_bytes(data, 0x5a));
     let tilde_bytes = minimal_journal_bytes(&variant_bytes(data, 0xa5));
 
-    if !layout.rewrite_all(&root_bytes, &machine_bytes, &tilde_bytes) {
-        return;
-    }
+    layout.rewrite_all(&root_bytes, &machine_bytes, &tilde_bytes);
 
-    exercise_open_paths(layout, false);
-    exercise_open_paths(layout, true);
+    exercise_open_paths(&layout, false);
+    exercise_open_paths(&layout, true);
 });

@@ -7,12 +7,11 @@ use crate::format::{
     compression_from_object_flags,
 };
 use crate::reader::ByteBuf;
-use crate::util::{checked_add_u64, read_u32_le, read_u64_le};
+use crate::util::{checked_add_u64, read_u64_le};
 
 #[derive(Debug, Clone, Copy)]
 struct HashItem {
     head_hash_offset: u64,
-    #[allow(dead_code)]
     tail_hash_offset: u64,
 }
 
@@ -20,15 +19,9 @@ struct HashItem {
 struct DataObjectMeta {
     hash: u64,
     next_hash_offset: u64,
-    #[allow(dead_code)]
-    next_field_offset: u64,
     entry_offset: u64,
     entry_array_offset: u64,
     n_entries: u64,
-    #[allow(dead_code)]
-    tail_entry_array_offset: Option<u32>,
-    #[allow(dead_code)]
-    tail_entry_array_n_entries: Option<u32>,
     flags: u8,
     size: u64,
 }
@@ -100,6 +93,12 @@ impl JournalFile {
                 Some(object_offset),
                 "DATA_HASH_TABLE object does not match the header offset and size",
             ));
+        }
+        if object_header.size > self.inner.config.max_object_size_bytes {
+            return Err(SdJournalError::LimitExceeded {
+                kind: LimitKind::ObjectSizeBytes,
+                limit: self.inner.config.max_object_size_bytes,
+            });
         }
         let table_end = checked_add_u64(table_offset, table_size, "DATA_HASH_TABLE range")?;
         if table_end > self.inner.used_size {
@@ -192,15 +191,6 @@ impl JournalFile {
         DataEntryOffsetIter::new(self.clone(), data, reverse)
     }
 
-    pub(crate) fn data_entry_offsets_after_offset(
-        &self,
-        data: DataObjectRef,
-        reverse: bool,
-        after_entry_offset: u64,
-    ) -> Result<DataEntryOffsetIter> {
-        DataEntryOffsetIter::new_after_offset(self.clone(), data, reverse, Some(after_entry_offset))
-    }
-
     fn payload_hash(&self, payload: &[u8]) -> u64 {
         if self.inner.header.is_keyed_hash() {
             crate::util::hash::siphash24(&self.inner.header.file_id, payload)
@@ -230,12 +220,6 @@ impl JournalFile {
 
     fn read_data_object_meta(&self, offset: u64) -> Result<DataObjectMeta> {
         self.validate_object_offset(offset)?;
-        if !offset.is_multiple_of(8) {
-            return Err(self.metadata_error(
-                Some(offset),
-                format!("DATA object offset is not 8-byte aligned: {offset}"),
-            ));
-        }
         let oh_bytes = self.read_bytes(offset, 16)?;
         let oh = ObjectHeader::parse(oh_bytes.as_slice(), self.path(), offset)?;
         if oh.object_type != OBJECT_DATA {
@@ -290,11 +274,6 @@ impl JournalFile {
             offset: Some(offset + 24),
             reason: "missing DATA.next_hash_offset".to_string(),
         })?;
-        let next_field_offset = read_u64_le(buf, 32).ok_or_else(|| SdJournalError::Corrupt {
-            path: Some(self.inner.path.clone()),
-            offset: Some(offset + 32),
-            reason: "missing DATA.next_field_offset".to_string(),
-        })?;
         let entry_offset = read_u64_le(buf, 40).ok_or_else(|| SdJournalError::Corrupt {
             path: Some(self.inner.path.clone()),
             offset: Some(offset + 40),
@@ -311,62 +290,24 @@ impl JournalFile {
             reason: "missing DATA.n_entries".to_string(),
         })?;
 
-        let (tail_entry_array_offset, tail_entry_array_n_entries) =
-            if self.inner.header.is_compact() {
-                let tail_entry_array_offset =
-                    read_u32_le(buf, 64).ok_or_else(|| SdJournalError::Corrupt {
-                        path: Some(self.inner.path.clone()),
-                        offset: Some(offset + 64),
-                        reason: "missing DATA.tail_entry_array_offset".to_string(),
-                    })?;
-                let tail_entry_array_n_entries =
-                    read_u32_le(buf, 68).ok_or_else(|| SdJournalError::Corrupt {
-                        path: Some(self.inner.path.clone()),
-                        offset: Some(offset + 68),
-                        reason: "missing DATA.tail_entry_array_n_entries".to_string(),
-                    })?;
-                (
-                    Some(tail_entry_array_offset),
-                    Some(tail_entry_array_n_entries),
-                )
-            } else {
-                (None, None)
-            };
-
         Ok(DataObjectMeta {
             hash,
             next_hash_offset,
-            next_field_offset,
             entry_offset,
             entry_array_offset,
             n_entries,
-            tail_entry_array_offset,
-            tail_entry_array_n_entries,
             flags: oh.flags,
             size: oh.size,
         })
     }
 
     fn read_data_payload_bytes(&self, offset: u64, meta: &DataObjectMeta) -> Result<ByteBuf> {
-        if meta.size > self.inner.config.max_object_size_bytes {
-            return Err(SdJournalError::LimitExceeded {
-                kind: LimitKind::ObjectSizeBytes,
-                limit: self.inner.config.max_object_size_bytes,
-            });
-        }
-
+        // Metadata parsing has already checked the size, committed bounds, and complete prefix.
         let payload_offset = if self.inner.header.is_compact() {
             72u64
         } else {
             64u64
         };
-        if meta.size < payload_offset {
-            return Err(SdJournalError::Corrupt {
-                path: Some(self.inner.path.clone()),
-                offset: Some(offset),
-                reason: "DATA object size smaller than payload offset".to_string(),
-            });
-        }
 
         let payload_len_u64 = meta.size - payload_offset;
         let payload_len =
@@ -380,47 +321,28 @@ impl JournalFile {
 
         let payload = match compression_from_object_flags(meta.flags)? {
             None => payload,
-            Some(CompressionAlgo::Xz) => {
-                if self.inner.header.incompatible_flags & HEADER_INCOMPATIBLE_COMPRESSED_XZ == 0 {
+            Some(algo) => {
+                let (flag, name) = match algo {
+                    CompressionAlgo::Xz => (HEADER_INCOMPATIBLE_COMPRESSED_XZ, "XZ"),
+                    CompressionAlgo::Lz4 => (HEADER_INCOMPATIBLE_COMPRESSED_LZ4, "LZ4"),
+                    CompressionAlgo::Zstd => (HEADER_INCOMPATIBLE_COMPRESSED_ZSTD, "ZSTD"),
+                };
+                if self.inner.header.incompatible_flags & flag == 0 {
                     return Err(SdJournalError::Corrupt {
                         path: Some(self.inner.path.clone()),
                         offset: Some(offset),
-                        reason: "DATA has XZ flag but file header missing incompatible flag"
-                            .to_string(),
+                        reason: format!(
+                            "DATA has {name} flag but file header missing incompatible flag"
+                        ),
                     });
                 }
-                ByteBuf::from_vec(decompress_xz(
-                    payload.as_slice(),
-                    self.inner.config.max_decompressed_bytes,
-                )?)
-            }
-            Some(CompressionAlgo::Lz4) => {
-                if self.inner.header.incompatible_flags & HEADER_INCOMPATIBLE_COMPRESSED_LZ4 == 0 {
-                    return Err(SdJournalError::Corrupt {
-                        path: Some(self.inner.path.clone()),
-                        offset: Some(offset),
-                        reason: "DATA has LZ4 flag but file header missing incompatible flag"
-                            .to_string(),
-                    });
-                }
-                ByteBuf::from_vec(decompress_lz4(
-                    payload.as_slice(),
-                    self.inner.config.max_decompressed_bytes,
-                )?)
-            }
-            Some(CompressionAlgo::Zstd) => {
-                if self.inner.header.incompatible_flags & HEADER_INCOMPATIBLE_COMPRESSED_ZSTD == 0 {
-                    return Err(SdJournalError::Corrupt {
-                        path: Some(self.inner.path.clone()),
-                        offset: Some(offset),
-                        reason: "DATA has ZSTD flag but file header missing incompatible flag"
-                            .to_string(),
-                    });
-                }
-                ByteBuf::from_vec(decompress_zstd(
-                    payload.as_slice(),
-                    self.inner.config.max_decompressed_bytes,
-                )?)
+                let max = self.inner.config.max_decompressed_bytes;
+                let decoded = match algo {
+                    CompressionAlgo::Xz => decompress_xz(payload.as_slice(), max)?,
+                    CompressionAlgo::Lz4 => decompress_lz4(payload.as_slice(), max)?,
+                    CompressionAlgo::Zstd => decompress_zstd(payload.as_slice(), max)?,
+                };
+                ByteBuf::from_vec(decoded)
             }
         };
 

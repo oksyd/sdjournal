@@ -93,7 +93,8 @@ pub struct JournalConfig {
 
     /// Maximum number of query terms (matches) accepted per query.
     ///
-    /// Unit helpers and OR groups can expand into several internal terms.
+    /// Each unit condition counts as three exact matches. OR-group terms also count toward
+    /// this limit.
     pub max_query_terms: usize,
 
     /// Whether to allow mmap for `STATE_ONLINE` journal files that may still be written.
@@ -117,13 +118,16 @@ pub struct JournalConfig {
     /// Maximum queued live entries per subscription.
     ///
     /// Live subscriptions use bounded queues. This prevents slow consumers from growing memory
-    /// without limit.
+    /// without limit. Zero and capacities whose queued values cannot fit a representable
+    /// allocation are rejected. This does not guarantee that enough memory is available.
     pub live_channel_capacity: usize,
 
-    /// Maximum entries decoded or dispatched by one live-engine cycle.
+    /// Maximum entries in a live-read or historical-replay delivery batch.
     ///
     /// Replay, topology refresh, and modified-file reads are split across multiple
     /// [`crate::LiveJournal::poll_once`] cycles when more entries remain.
+    /// Historical filtering may inspect additional entries to find matches, including a
+    /// lookahead entry. This is a batch-size limit, not a CPU-time or I/O-operation budget.
     pub max_live_batch_entries: usize,
 
     /// Optional maximum matching historical entries replayed for a single subscription.

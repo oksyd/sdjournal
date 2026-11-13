@@ -3,16 +3,21 @@ name = "sdjournal-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
+rust-version = "1.100.0"
 
 [package.metadata]
 cargo-fuzz = true
 
 [dependencies]
 # Fuzzing runtime integration.
-libfuzzer-sys = "0.4.12"
+libfuzzer-sys = { version = "0.4.13", default-features = false, features = ["link_libfuzzer"] }
+tempfile = { version = "3.27.0", default-features = false }
 
 # Local crate under test.
-sdjournal = { path = ".." }
+sdjournal = { path = "..", default-features = false, features = ["mmap", "lz4", "zstd", "xz"] }
+
+[lints.cargo]
+unused_dependencies = "deny"
 
 [[bin]]
 name = "journal_open"

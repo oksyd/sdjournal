@@ -7,14 +7,11 @@ use crate::config::JournalConfig;
 #[cfg(feature = "mmap")]
 use crate::config::MmapPolicy;
 use crate::error::{LimitKind, Result, SdJournalError};
-use crate::format::{Header, ObjectHeader, STATE_ARCHIVED};
+use crate::format::{HEADER_SIZE_MIN, Header, ObjectHeader, STATE_ARCHIVED};
 #[cfg(feature = "mmap")]
 use crate::format::{STATE_OFFLINE, STATE_ONLINE};
-#[cfg(feature = "mmap")]
-use crate::reader::MmapAccess;
-use crate::reader::{ByteBuf, FileAccess, ReopenAccess};
+use crate::reader::{ByteBuf, FileAccess, open_readonly, read_file_at};
 use crate::util::checked_add_u64;
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
@@ -22,7 +19,8 @@ use std::time::SystemTime;
 #[cfg(feature = "tracing")]
 use tracing::debug;
 
-pub(crate) use self::iter::{DataEntryOffsetIter, EntryMeta, EntryRange, FileEntryIter};
+pub(crate) use self::iter::{DataEntryOffsetIter, FileEntryIter};
+pub(crate) use crate::cursor::SdJournalEntryKey as EntryMeta;
 
 #[derive(Clone)]
 pub(crate) struct JournalFile {
@@ -46,15 +44,7 @@ struct JournalFileInner {
     file_len: u64,
     modified_at_open: Option<SystemTime>,
     entry_index: OnceLock<Arc<self::iter::EntryIndex>>,
-    access: Access,
-}
-
-#[derive(Clone)]
-enum Access {
-    #[cfg(feature = "mmap")]
-    Mmap(MmapAccess),
-    File(FileAccess),
-    Reopen(ReopenAccess),
+    access: FileAccess,
 }
 
 impl JournalFile {
@@ -67,6 +57,9 @@ impl JournalFile {
     }
 
     pub(crate) fn reopen_snapshot(&self) -> Self {
+        if matches!(&self.inner.access, FileAccess::Reopen { .. }) {
+            return self.clone();
+        }
         Self {
             inner: Arc::new(JournalFileInner {
                 path: self.inner.path.clone(),
@@ -76,20 +69,16 @@ impl JournalFile {
                 file_len: self.inner.file_len,
                 modified_at_open: self.inner.modified_at_open,
                 entry_index: self.inner.entry_index.clone(),
-                access: Access::Reopen(ReopenAccess::new(
-                    self.inner.path.clone(),
-                    self.inner.header.file_id,
-                    self.inner.header.seqnum_id,
-                )),
+                access: FileAccess::Reopen {
+                    expected_file_id: self.inner.header.file_id,
+                    expected_seqnum_id: self.inner.header.seqnum_id,
+                },
             }),
         }
     }
 
     pub(crate) fn validate_reopen_identity(&self) -> Result<()> {
-        if let Access::Reopen(access) = &self.inner.access {
-            access.validate_identity()?;
-        }
-        Ok(())
+        self.inner.access.validate_identity(self.path())
     }
 
     fn open_with_access(
@@ -97,32 +86,18 @@ impl JournalFile {
         config: &JournalConfig,
         reopen_each_read: bool,
     ) -> Result<Self> {
-        let file = Arc::new(File::open(&path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                SdJournalError::PermissionDenied { path: path.clone() }
-            } else {
-                SdJournalError::io("open", Some(path.clone()), e)
-            }
-        })?);
+        let file = open_readonly(&path)?;
 
-        Self::open_from_file(path, file, config, reopen_each_read)
-    }
-
-    fn open_from_file(
-        path: PathBuf,
-        file: Arc<File>,
-        config: &JournalConfig,
-        reopen_each_read: bool,
-    ) -> Result<Self> {
         let opening_metadata = file
             .metadata()
             .map_err(|e| SdJournalError::io("metadata", Some(path.clone()), e))?;
         let file_len = opening_metadata.len();
         let modified_at_open = opening_metadata.modified().ok();
 
-        let file_access = FileAccess::new(path.clone(), file.clone());
-        let header_len = usize::try_from(file_len).unwrap_or(usize::MAX).min(272);
-        let header_buf = file_access.read_known_valid(0, header_len)?;
+        let header_len = usize::try_from(file_len)
+            .unwrap_or(usize::MAX)
+            .min(HEADER_SIZE_MIN as usize);
+        let header_buf = read_file_at(&file, &path, 0, header_len)?;
         let header = Header::parse(header_buf.as_slice(), &path)?;
         let arena_end = checked_add_u64(
             header.header_size,
@@ -174,13 +149,12 @@ impl JournalFile {
                     reason: "tail_object_offset is outside the committed object arena".to_string(),
                 });
             }
-            let tail_header = file_access.read_known_valid(tail_offset, 16)?;
+            let tail_header = read_file_at(&file, &path, tail_offset, 16)?;
             let tail_object = ObjectHeader::parse(tail_header.as_slice(), &path, tail_offset)?;
             let raw_committed_end =
                 checked_add_u64(tail_offset, tail_object.size, "tail object committed range")?;
             let committed_end = raw_committed_end
-                .checked_add(7)
-                .map(|end| end & !7)
+                .checked_next_multiple_of(8)
                 .ok_or_else(|| SdJournalError::Corrupt {
                     path: Some(path.clone()),
                     offset: Some(tail_offset),
@@ -199,11 +173,10 @@ impl JournalFile {
         };
 
         let access = if reopen_each_read {
-            Access::Reopen(ReopenAccess::new(
-                path.clone(),
-                header.file_id,
-                header.seqnum_id,
-            ))
+            FileAccess::Reopen {
+                expected_file_id: header.file_id,
+                expected_seqnum_id: header.seqnum_id,
+            }
         } else {
             #[cfg(feature = "mmap")]
             {
@@ -217,22 +190,29 @@ impl JournalFile {
                 };
 
                 if use_mmap {
+                    let mmap_len =
+                        usize::try_from(used_size).map_err(|_| SdJournalError::Unsupported {
+                            reason: format!(
+                                "journal snapshot is too large to mmap: {used_size} bytes"
+                            ),
+                        })?;
                     // SAFETY: Mapping a file is inherently `unsafe` because the file may change on disk.
                     // We reduce risk by:
                     // - validating `used_size <= file_len` before mapping;
+                    // - mapping only the committed prefix, not preallocated/uncommitted space;
                     // - defaulting to mmap only for STATE_OFFLINE/STATE_ARCHIVED files unless explicitly enabled;
                     // - performing bounds checks on every read.
-                    let mmap = unsafe { memmap2::MmapOptions::new().map(file.as_ref()) }
+                    let mmap = unsafe { memmap2::MmapOptions::new().len(mmap_len).map(&file) }
                         .map_err(|e| SdJournalError::io("mmap", Some(path.clone()), e))?;
-                    Access::Mmap(MmapAccess::new(path.clone(), file.clone(), Arc::new(mmap)))
+                    FileAccess::Mmap(Arc::new(mmap))
                 } else {
-                    Access::File(file_access)
+                    FileAccess::File(file)
                 }
             }
 
             #[cfg(not(feature = "mmap"))]
             {
-                Access::File(file_access)
+                FileAccess::File(file)
             }
         };
 
@@ -264,25 +244,6 @@ impl JournalFile {
 
     pub(crate) fn is_online(&self) -> bool {
         self.inner.header.state == crate::format::STATE_ONLINE
-    }
-
-    pub(crate) fn entry_range(&self) -> Result<Option<EntryRange>> {
-        let has_entries = self.inner.header.n_entries != 0;
-        let has_entry_array = self.inner.header.entry_array_offset != 0;
-        if has_entries != has_entry_array {
-            return Err(self.metadata_error(
-                Some(if has_entries { 176 } else { 152 }),
-                format!(
-                    "inconsistent entry metadata (n_entries={}, entry_array_offset={})",
-                    self.inner.header.n_entries, self.inner.header.entry_array_offset
-                ),
-            ));
-        }
-        if !has_entries {
-            return Ok(None);
-        }
-
-        self.snapshot_entry_range().map(Some)
     }
 
     pub(crate) fn live_state(&self) -> LiveFileState {
@@ -318,24 +279,15 @@ impl JournalFile {
         &self.inner.config
     }
 
-    pub(crate) fn entry_iter_seek_realtime(
-        &self,
-        reverse: bool,
-        since_realtime: Option<u64>,
-        until_realtime: Option<u64>,
-    ) -> Result<FileEntryIter> {
-        self.validate_entry_index_metadata()?;
-        FileEntryIter::new_with_seek_realtime(self.clone(), reverse, since_realtime, until_realtime)
+    pub(crate) fn entry_iter(&self, reverse: bool) -> Result<FileEntryIter> {
+        FileEntryIter::new(self.clone(), reverse)
     }
 
     pub(crate) fn entry_iter_after_offset(
         &self,
         reverse: bool,
         entry_offset: u64,
-        _since_realtime: Option<u64>,
-        _until_realtime: Option<u64>,
     ) -> Result<FileEntryIter> {
-        self.validate_entry_index_metadata()?;
         FileEntryIter::new_after_offset(self.clone(), reverse, entry_offset)
     }
 
@@ -349,12 +301,7 @@ impl JournalFile {
             });
         }
 
-        match &self.inner.access {
-            Access::File(access) => access.read_known_valid(offset, len),
-            Access::Reopen(access) => access.read_known_valid(offset, len),
-            #[cfg(feature = "mmap")]
-            Access::Mmap(access) => access.read_known_valid(offset, len),
-        }
+        self.inner.access.read_known_valid(self.path(), offset, len)
     }
 
     pub(crate) fn read_object(&self, offset: u64, size: u64) -> Result<ByteBuf> {
@@ -423,5 +370,59 @@ impl JournalFile {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "mmap"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mmap_only_maps_the_committed_snapshot_prefix() {
+        const ALLOCATED_SIZE: u64 = 1024 * 1024;
+        for state in [STATE_OFFLINE, STATE_ONLINE, STATE_ARCHIVED] {
+            for has_objects in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let path = root.path().join("preallocated.journal");
+                let used_size = if has_objects { 240usize } else { 208 };
+                let mut bytes = vec![0; used_size];
+                bytes[..8].copy_from_slice(crate::format::HEADER_SIGNATURE);
+                bytes[16] = state;
+                bytes[88..96].copy_from_slice(&208u64.to_le_bytes());
+                bytes[96..104].copy_from_slice(&(ALLOCATED_SIZE - 208).to_le_bytes());
+                if has_objects {
+                    bytes[136..144].copy_from_slice(&208u64.to_le_bytes());
+                    bytes[208] = crate::format::OBJECT_DATA_HASH_TABLE;
+                    bytes[216..224].copy_from_slice(&32u64.to_le_bytes());
+                }
+                std::fs::write(&path, bytes).unwrap();
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(ALLOCATED_SIZE)
+                    .unwrap();
+
+                let file = JournalFile::open(
+                    path,
+                    &JournalConfig {
+                        mmap_policy: MmapPolicy::Auto,
+                        allow_mmap_online: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let FileAccess::Mmap(map) = &file.inner.access else {
+                    panic!("expected mmap access");
+                };
+                assert_eq!(map.len(), used_size);
+                assert_eq!(file.inner.file_len, ALLOCATED_SIZE);
+                assert_eq!(
+                    file.read_bytes(0, used_size).unwrap().as_slice().len(),
+                    used_size
+                );
+                assert!(file.read_bytes(used_size as u64, 1).is_err());
+            }
+        }
     }
 }

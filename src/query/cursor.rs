@@ -1,7 +1,5 @@
 use super::JournalQuery;
-use crate::cursor::{
-    LegacyEntryKey, SdJournalEntryKey, SystemdCursor, compare_entry_keys, same_entry,
-};
+use crate::cursor::{Cursor, SystemdCursor, compare_entry_keys, same_entry};
 use crate::error::{Result, SdJournalError};
 use crate::file::{EntryMeta, JournalFile};
 use std::cmp::Ordering;
@@ -10,25 +8,26 @@ use std::cmp::Ordering;
 pub(super) struct CursorStart {
     boundary: CursorBoundary,
     inclusive: bool,
-    exact_meta: Option<EntryMeta>,
 }
 
 #[derive(Debug, Clone)]
 enum CursorBoundary {
-    Full(SdJournalEntryKey),
-    Legacy(LegacyEntryKey),
+    Exact(EntryMeta),
     Systemd(SystemdCursor),
 }
 
 impl CursorStart {
     pub(super) fn exact_meta(&self) -> Option<EntryMeta> {
-        self.exact_meta
+        match self.boundary {
+            CursorBoundary::Exact(meta) => Some(meta),
+            CursorBoundary::Systemd(_) => None,
+        }
     }
 
     pub(super) fn matches_exact(&self, meta: &EntryMeta) -> bool {
         match &self.boundary {
-            CursorBoundary::Full(key) => same_entry(&entry_key_from_meta(meta), key),
-            CursorBoundary::Legacy(_) | CursorBoundary::Systemd(_) => false,
+            CursorBoundary::Exact(key) => same_entry(meta, key),
+            CursorBoundary::Systemd(_) => false,
         }
     }
 
@@ -38,8 +37,7 @@ impl CursorStart {
 
     pub(super) fn accepts(&self, meta: &EntryMeta) -> bool {
         let ordering = match &self.boundary {
-            CursorBoundary::Full(key) => compare_entry_keys(&entry_key_from_meta(meta), key),
-            CursorBoundary::Legacy(key) => compare_legacy(meta, key),
+            CursorBoundary::Exact(key) => compare_entry_keys(meta, key),
             CursorBoundary::Systemd(cursor) => compare_systemd(meta, cursor),
         };
 
@@ -51,180 +49,38 @@ impl CursorStart {
     }
 }
 
-pub(super) fn entry_key_from_meta(meta: &EntryMeta) -> SdJournalEntryKey {
-    SdJournalEntryKey {
-        file_id: meta.file_id,
-        entry_offset: meta.entry_offset,
-        seqnum_id: meta.seqnum_id,
-        seqnum: meta.seqnum,
-        boot_id: meta.boot_id,
-        monotonic_usec: meta.monotonic_usec,
-        realtime_usec: meta.realtime_usec,
-        xor_hash: meta.xor_hash,
-    }
-}
-
 pub(super) fn build_cursor_start(query: &JournalQuery) -> Result<Option<CursorStart>> {
     let (cursor, inclusive) = match &query.cursor_start {
         Some(value) => value,
         None => return Ok(None),
     };
 
-    if let Some(key) = cursor.sdjournal_entry_key() {
-        let Some(exact_meta) = resolve_full_key(query, &key)? else {
-            return Err(SdJournalError::NotFound);
-        };
-        return Ok(Some(CursorStart {
-            boundary: CursorBoundary::Full(key),
-            inclusive: *inclusive,
-            exact_meta: Some(exact_meta),
-        }));
-    }
-
-    if let Some(key) = cursor.legacy_entry_key() {
-        let (boundary, exact_meta) = match resolve_file_offset(query, key.file_id, key.entry_offset)
-        {
-            Ok(meta) if meta.seqnum == key.seqnum && meta.realtime_usec == key.realtime_usec => {
-                let full = entry_key_from_meta(&meta);
-                (CursorBoundary::Full(full), Some(meta))
-            }
-            Ok(_) => return Err(SdJournalError::NotFound),
-            // Legacy SJ1 cursors were intentionally self-contained. Keep their historical
-            // ordering available when the original rotated file is no longer present.
-            Err(SdJournalError::NotFound) => (CursorBoundary::Legacy(key), None),
-            Err(error) => return Err(error),
-        };
-        return Ok(Some(CursorStart {
-            boundary,
-            inclusive: *inclusive,
-            exact_meta,
-        }));
-    }
-
-    if let Some((file_id, entry_offset)) = cursor.file_offset() {
-        let meta = resolve_file_offset(query, file_id, entry_offset)?;
-        let full = entry_key_from_meta(&meta);
-        return Ok(Some(CursorStart {
-            boundary: CursorBoundary::Full(full),
-            inclusive: *inclusive,
-            exact_meta: Some(meta),
-        }));
-    }
-
-    if let Some(systemd) = cursor.systemd() {
-        if !systemd_cursor_is_unique(systemd) {
-            return Ok(Some(CursorStart {
-                boundary: CursorBoundary::Systemd(systemd.clone()),
-                inclusive: *inclusive,
-                exact_meta: None,
-            }));
-        }
-        let (boundary, exact_meta) = match find_exact_systemd_cursor(query, systemd) {
-            Ok(Some(meta)) => {
-                let full = entry_key_from_meta(&meta);
-                (CursorBoundary::Full(full), Some(meta))
-            }
-            Ok(None) => return Err(SdJournalError::NotFound),
-            Err(error) => return Err(error),
-        };
-        return Ok(Some(CursorStart {
-            boundary,
-            inclusive: *inclusive,
-            exact_meta,
-        }));
-    }
-
-    Err(SdJournalError::InvalidQuery {
-        reason: "unsupported cursor format".to_string(),
-    })
-}
-
-fn systemd_cursor_is_unique(cursor: &SystemdCursor) -> bool {
-    cursor.seqnum_id.is_some() && cursor.seqnum.is_some()
-}
-
-fn resolve_full_key(query: &JournalQuery, key: &SdJournalEntryKey) -> Result<Option<EntryMeta>> {
-    for index in 0..query.journal.inner.file_count() {
-        let Some(info) = query.journal.inner.file_info(index) else {
-            continue;
-        };
-        if info.file_id != key.file_id {
-            continue;
-        }
-
-        let file = query.journal.inner.open_file_by_index(index)?;
-        if let Some(meta) = committed_meta_at_offset(&file, key.entry_offset)?
-            && same_entry(&entry_key_from_meta(&meta), key)
-        {
-            return Ok(Some(meta));
-        }
-    }
-
-    // A logical entry can survive rotation or vacuuming in a different journal file. Use the
-    // same fallback identity as a serialized cursor, which intentionally omits physical location.
-    find_exact_systemd_cursor(
-        query,
-        &SystemdCursor {
-            seqnum_id: Some(key.seqnum_id),
-            seqnum: Some(key.seqnum),
-            boot_id: Some(key.boot_id),
-            monotonic_usec: Some(key.monotonic_usec),
-            realtime_usec: Some(key.realtime_usec),
-            xor_hash: Some(key.xor_hash),
-        },
-    )
-}
-
-fn resolve_file_offset(
-    query: &JournalQuery,
-    file_id: [u8; 16],
-    entry_offset: u64,
-) -> Result<EntryMeta> {
-    for index in 0..query.journal.inner.file_count() {
-        let Some(info) = query.journal.inner.file_info(index) else {
-            continue;
-        };
-        if info.file_id != file_id {
-            continue;
-        }
-
-        let file = query.journal.inner.open_file_by_index(index)?;
-        return committed_meta_at_offset(&file, entry_offset)?.ok_or(SdJournalError::NotFound);
-    }
-
-    Err(SdJournalError::NotFound)
+    let boundary = if cursor.fields.seqnum_id.is_some() && cursor.fields.seqnum.is_some() {
+        CursorBoundary::Exact(
+            find_exact_systemd_cursor(query, cursor)?.ok_or(SdJournalError::NotFound)?,
+        )
+    } else {
+        CursorBoundary::Systemd(cursor.fields.clone())
+    };
+    Ok(Some(CursorStart {
+        boundary,
+        inclusive: *inclusive,
+    }))
 }
 
 fn committed_meta_at_offset(file: &JournalFile, entry_offset: u64) -> Result<Option<EntryMeta>> {
     // A syntactically valid ENTRY may have been prewritten before n_entries was committed, or
     // may not belong to the file-level ENTRY array at all. Cursors must not inject such objects
     // into a query. Seek in the validated, snapshotted array instead of reading the offset raw.
-    let mut entries =
-        file.entry_iter_after_offset(false, entry_offset.saturating_sub(1), None, None)?;
+    let mut entries = file.entry_iter_after_offset(false, entry_offset.saturating_sub(1))?;
     match entries.next().transpose()? {
         Some(meta) if meta.entry_offset == entry_offset => Ok(Some(meta)),
         _ => Ok(None),
     }
 }
 
-fn compare_legacy(meta: &EntryMeta, key: &LegacyEntryKey) -> Ordering {
-    meta.realtime_usec
-        .cmp(&key.realtime_usec)
-        .then_with(|| meta.seqnum.cmp(&key.seqnum))
-        .then_with(|| meta.file_id.cmp(&key.file_id))
-        .then_with(|| meta.entry_offset.cmp(&key.entry_offset))
-}
-
 fn compare_systemd(meta: &EntryMeta, cursor: &SystemdCursor) -> Ordering {
-    if let (Some(seqnum_id), Some(seqnum)) = (cursor.seqnum_id, cursor.seqnum)
-        && meta.seqnum_id == seqnum_id
-    {
-        let ordering = meta.seqnum.cmp(&seqnum);
-        if ordering != Ordering::Equal {
-            return ordering;
-        }
-    }
-
+    // Sequence cursors are resolved to exact entry positions before reaching this comparison.
     if let (Some(boot_id), Some(monotonic_usec)) = (cursor.boot_id, cursor.monotonic_usec)
         && meta.boot_id == boot_id
     {
@@ -246,23 +102,39 @@ fn compare_systemd(meta: &EntryMeta, cursor: &SystemdCursor) -> Ordering {
         .map_or(Ordering::Equal, |xor_hash| meta.xor_hash.cmp(&xor_hash))
 }
 
-fn find_exact_systemd_cursor(
-    query: &JournalQuery,
-    systemd: &SystemdCursor,
-) -> Result<Option<EntryMeta>> {
+fn find_exact_systemd_cursor(query: &JournalQuery, cursor: &Cursor) -> Result<Option<EntryMeta>> {
+    let systemd = &cursor.fields;
     let mut first_error = None;
+    if let Some(location) = cursor.location_hint
+        && let Some(info) = query
+            .journal
+            .inner
+            .file_infos
+            .iter()
+            .find(|info| info.file_id == location.file_id)
+    {
+        match info
+            .open()
+            .and_then(|file| committed_meta_at_offset(&file, location.entry_offset))
+        {
+            Ok(Some(meta)) if systemd_cursor_matches(&meta, systemd) => return Ok(Some(meta)),
+            Err(error) => {
+                first_error = Some(error);
+            }
+            _ => {}
+        }
+    }
 
-    for index in 0..query.journal.inner.file_count() {
-        let Some(info) = query.journal.inner.file_info(index) else {
-            continue;
-        };
+    // The logical entry can survive rotation in a different physical file. Persisted cursors
+    // take this same path because the text contains no location hint.
+    for info in &query.journal.inner.file_infos {
         if let Some(seqnum_id) = systemd.seqnum_id
             && info.seqnum_id != seqnum_id
         {
             continue;
         }
 
-        let file = match query.journal.inner.open_file_by_index(index) {
+        let file = match info.open() {
             Ok(file) => file,
             Err(error) => {
                 first_error.get_or_insert(error);
@@ -270,7 +142,7 @@ fn find_exact_systemd_cursor(
             }
         };
 
-        let iter = match file.entry_iter_seek_realtime(false, None, None) {
+        let iter = match file.entry_iter(false) {
             Ok(iter) => iter,
             Err(error) => {
                 first_error.get_or_insert(error);
@@ -283,7 +155,7 @@ fn find_exact_systemd_cursor(
                 Ok(meta) => meta,
                 Err(error) => {
                     first_error.get_or_insert(error);
-                    break;
+                    continue;
                 }
             };
             if systemd_cursor_matches(&meta, systemd) {

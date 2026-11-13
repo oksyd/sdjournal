@@ -1,5 +1,4 @@
 use crate::cursor::{Cursor, SdJournalEntryKey};
-use crate::error::Result;
 use crate::reader::ByteBuf;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -11,14 +10,7 @@ use std::sync::Arc;
 /// boundaries without keeping journal storage alive.
 #[derive(Debug, Clone)]
 pub struct EntryOwned {
-    pub(crate) file_id: [u8; 16],
-    pub(crate) entry_offset: u64,
-    seqnum_id: [u8; 16],
-    seqnum: u64,
-    realtime_usec: u64,
-    monotonic_usec: u64,
-    boot_id: [u8; 16],
-    xor_hash: u64,
+    key: SdJournalEntryKey,
     fields_in_order: Vec<(String, Vec<u8>)>,
 }
 
@@ -63,14 +55,7 @@ impl AsRef<EntryRef> for LiveEntry {
 impl EntryOwned {
     pub(crate) fn new(key: SdJournalEntryKey, fields_in_order: Vec<(String, Vec<u8>)>) -> Self {
         Self {
-            file_id: key.file_id,
-            entry_offset: key.entry_offset,
-            seqnum_id: key.seqnum_id,
-            seqnum: key.seqnum,
-            realtime_usec: key.realtime_usec,
-            monotonic_usec: key.monotonic_usec,
-            boot_id: key.boot_id,
-            xor_hash: key.xor_hash,
+            key,
             fields_in_order,
         }
     }
@@ -79,8 +64,8 @@ impl EntryOwned {
     ///
     /// Store this cursor to resume later with [`crate::JournalQuery::after_cursor`] or
     /// [`crate::SubscriptionOptions::after_cursor`].
-    pub fn cursor(&self) -> Result<Cursor> {
-        Ok(Cursor::new_location_key(self.entry_key()))
+    pub fn cursor(&self) -> Cursor {
+        Cursor::from(self.key)
     }
 
     /// Get the first occurrence of a field.
@@ -103,97 +88,53 @@ impl EntryOwned {
 
     /// Realtime timestamp, microseconds since UNIX epoch.
     pub fn realtime_usec(&self) -> u64 {
-        self.realtime_usec
+        self.key.realtime_usec
     }
 
     /// Monotonic timestamp, microseconds since boot.
     pub fn monotonic_usec(&self) -> u64 {
-        self.monotonic_usec
+        self.key.monotonic_usec
     }
 
     /// Boot ID for this entry.
     pub fn boot_id(&self) -> [u8; 16] {
-        self.boot_id
+        self.key.boot_id
     }
 
     /// Sequence number for this entry.
     pub fn seqnum(&self) -> u64 {
-        self.seqnum
-    }
-
-    pub(crate) fn entry_key(&self) -> SdJournalEntryKey {
-        SdJournalEntryKey {
-            file_id: self.file_id,
-            entry_offset: self.entry_offset,
-            seqnum_id: self.seqnum_id,
-            seqnum: self.seqnum,
-            boot_id: self.boot_id,
-            monotonic_usec: self.monotonic_usec,
-            realtime_usec: self.realtime_usec,
-            xor_hash: self.xor_hash,
-        }
+        self.key.seqnum
     }
 }
 
 #[derive(Debug, Clone)]
-struct FieldRef {
-    payload: ByteBuf,
-    eq_pos: usize,
+pub(crate) struct FieldRef {
+    pub(crate) name: Box<str>,
+    pub(crate) payload: ByteBuf,
 }
 
 impl FieldRef {
-    fn name(&self) -> &str {
-        let bytes = self
-            .payload
-            .as_slice()
-            .get(..self.eq_pos)
-            .unwrap_or_default();
-        std::str::from_utf8(bytes).unwrap_or_default()
-    }
-
     fn value(&self) -> &[u8] {
-        let payload = self.payload.as_slice();
-        payload.get(self.eq_pos.saturating_add(1)..).unwrap_or(&[])
+        // The parser validates the name and separator before constructing a field.
+        &self.payload.as_slice()[self.name.len() + 1..]
     }
 }
 
-/// A zero-copy entry view, backed by journal file storage when possible.
+/// An entry view with zero-copy field values when backed by journal file storage.
 ///
-/// Query iterators yield `EntryRef` to avoid copying field payloads by default. The value is cheap
-/// to inspect during iteration, but callers should use [`EntryRef::to_owned`] before storing it in
-/// long-lived application state.
+/// Field names are validated and owned; field values share the underlying storage when possible.
+/// The entry is cheap to inspect during iteration, but callers should use [`EntryRef::to_owned`]
+/// before storing it in long-lived application state.
 #[derive(Debug, Clone)]
 pub struct EntryRef {
-    file_id: [u8; 16],
-    entry_offset: u64,
-    seqnum_id: [u8; 16],
-    seqnum: u64,
-    realtime_usec: u64,
-    monotonic_usec: u64,
-    boot_id: [u8; 16],
-    xor_hash: u64,
+    key: SdJournalEntryKey,
     fields_in_order: Vec<FieldRef>,
 }
 
 impl EntryRef {
-    pub(crate) fn new_parsed(
-        key: SdJournalEntryKey,
-        fields_in_order: Vec<(ByteBuf, usize)>,
-    ) -> Self {
-        let fields_in_order = fields_in_order
-            .into_iter()
-            .map(|(payload, eq_pos)| FieldRef { payload, eq_pos })
-            .collect();
-
+    pub(crate) fn new_parsed(key: SdJournalEntryKey, fields_in_order: Vec<FieldRef>) -> Self {
         Self {
-            file_id: key.file_id,
-            entry_offset: key.entry_offset,
-            seqnum_id: key.seqnum_id,
-            seqnum: key.seqnum,
-            realtime_usec: key.realtime_usec,
-            monotonic_usec: key.monotonic_usec,
-            boot_id: key.boot_id,
-            xor_hash: key.xor_hash,
+            key,
             fields_in_order,
         }
     }
@@ -204,7 +145,7 @@ impl EntryRef {
     pub fn to_owned(&self) -> EntryOwned {
         let mut fields = Vec::with_capacity(self.fields_in_order.len());
         for f in &self.fields_in_order {
-            fields.push((f.name().to_owned(), f.value().to_vec()));
+            fields.push((f.name.to_string(), f.value().to_vec()));
         }
 
         EntryOwned::new(self.entry_key(), fields)
@@ -214,8 +155,8 @@ impl EntryRef {
     ///
     /// Store this cursor to resume later with [`crate::JournalQuery::after_cursor`] or
     /// [`crate::SubscriptionOptions::after_cursor`].
-    pub fn cursor(&self) -> Result<Cursor> {
-        Ok(Cursor::new_location_key(self.entry_key()))
+    pub fn cursor(&self) -> Cursor {
+        Cursor::from(self.entry_key())
     }
 
     /// Get the first occurrence of a field.
@@ -225,46 +166,39 @@ impl EntryRef {
     pub fn get(&self, field: &str) -> Option<&[u8]> {
         self.fields_in_order
             .iter()
-            .find(|f| f.name() == field)
+            .find(|f| f.name.as_ref() == field)
             .map(|f| f.value())
     }
 
     /// Iterate over all fields, including duplicates, in entry order.
     pub fn iter_fields(&self) -> impl Iterator<Item = (&str, &[u8])> {
-        self.fields_in_order.iter().map(|f| (f.name(), f.value()))
+        self.fields_in_order
+            .iter()
+            .map(|f| (f.name.as_ref(), f.value()))
     }
 
     /// Realtime timestamp, microseconds since UNIX epoch.
     pub fn realtime_usec(&self) -> u64 {
-        self.realtime_usec
+        self.key.realtime_usec
     }
 
     /// Monotonic timestamp, microseconds since boot.
     pub fn monotonic_usec(&self) -> u64 {
-        self.monotonic_usec
+        self.key.monotonic_usec
     }
 
     /// Boot ID for this entry.
     pub fn boot_id(&self) -> [u8; 16] {
-        self.boot_id
+        self.key.boot_id
     }
 
     /// Sequence number for this entry.
     pub fn seqnum(&self) -> u64 {
-        self.seqnum
+        self.key.seqnum
     }
 
     pub(crate) fn entry_key(&self) -> SdJournalEntryKey {
-        SdJournalEntryKey {
-            file_id: self.file_id,
-            entry_offset: self.entry_offset,
-            seqnum_id: self.seqnum_id,
-            seqnum: self.seqnum,
-            boot_id: self.boot_id,
-            monotonic_usec: self.monotonic_usec,
-            realtime_usec: self.realtime_usec,
-            xor_hash: self.xor_hash,
-        }
+        self.key
     }
 }
 
@@ -318,8 +252,14 @@ mod tests {
                 xor_hash: 31,
             },
             vec![
-                (ByteBuf::from_vec(b"MESSAGE=hello".to_vec()), 7),
-                (ByteBuf::from_vec(b"PRIORITY=5".to_vec()), 8),
+                FieldRef {
+                    name: "MESSAGE".into(),
+                    payload: ByteBuf::from_vec(b"MESSAGE=hello".to_vec()),
+                },
+                FieldRef {
+                    name: "PRIORITY".into(),
+                    payload: ByteBuf::from_vec(b"PRIORITY=5".to_vec()),
+                },
             ],
         );
 
@@ -327,10 +267,7 @@ mod tests {
         assert_eq!(entry.get("MESSAGE"), Some(&b"hello"[..]));
         assert_eq!(owned.get("MESSAGE"), Some(&b"hello"[..]));
         assert_eq!(owned.get("PRIORITY"), Some(&b"5"[..]));
-        assert_eq!(
-            entry.cursor().unwrap().to_string(),
-            owned.cursor().unwrap().to_string()
-        );
+        assert_eq!(entry.cursor().to_string(), owned.cursor().to_string());
         assert_eq!(owned.realtime_usec(), 23);
         assert_eq!(owned.monotonic_usec(), 29);
         assert_eq!(owned.seqnum(), 19);

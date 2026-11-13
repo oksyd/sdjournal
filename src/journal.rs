@@ -1,11 +1,13 @@
 use crate::config::JournalConfig;
 use crate::cursor::Cursor;
 use crate::error::{LimitKind, Result, SdJournalError};
-use crate::file::{EntryRange, JournalFile};
+use crate::file::JournalFile;
+use crate::filter::Filter;
 use crate::live::LiveJournal;
 use crate::query::JournalQuery;
 use std::collections::{BTreeSet, HashSet};
 use std::ffi::OsStr;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -26,20 +28,16 @@ pub(crate) struct JournalInner {
     pub(crate) file_infos: Vec<JournalFileInfo>,
 }
 
-#[derive(Clone)]
 pub(crate) struct JournalFileInfo {
-    pub(crate) path: PathBuf,
     pub(crate) file_id: [u8; 16],
     pub(crate) seqnum_id: [u8; 16],
-    pub(crate) entry_range: Option<EntryRange>,
-    pub(crate) entry_range_known: bool,
-    file: JournalFile,
-    keep_open: bool,
+    pub(crate) file: JournalFile,
 }
 
 pub(crate) struct JournalDiscovery {
     pub(crate) roots: Vec<PathBuf>,
     pub(crate) candidates: Vec<PathBuf>,
+    pub(crate) missing_roots: Vec<PathBuf>,
 }
 
 impl Journal {
@@ -98,7 +96,9 @@ impl Journal {
     /// Open journal files discovered under multiple root directories using a custom configuration.
     ///
     /// Discovery skips symlinks, only keeps files with supported journal extensions, and
-    /// deduplicates opened files by journal file ID.
+    /// deduplicates opened files by journal file ID. Missing roots and entries that disappear
+    /// during discovery are skipped. Other discovery errors are returned even if another root
+    /// contains readable journals.
     ///
     /// When discovery finds more files than [`JournalConfig::max_open_files`], the returned
     /// [`Journal`] stores file paths and opens files on demand while queries perform a streaming
@@ -110,31 +110,40 @@ impl Journal {
     /// - [`SdJournalError::InvalidQuery`] when `paths` is empty.
     /// - [`SdJournalError::NotFound`] when no usable journal files are found.
     /// - [`SdJournalError::LimitExceeded`] when discovery exceeds configured file limits.
+    /// - An underlying directory error when discovery fails for a reason other than a missing path.
     /// - An underlying file or parse error when all candidates fail to open.
     pub fn open_dirs_with_config(paths: &[PathBuf], config: JournalConfig) -> Result<Self> {
         validate_journal_config(&config)?;
         let discovery = discover_journal_candidates(paths, &config)?;
-        let file_set = open_journal_file_set(discovery.candidates, &config)?;
+        let file_infos = open_journal_files(discovery.candidates, &config)?;
 
         #[cfg(feature = "tracing")]
-        debug!(
-            n_files = file_set.file_infos.len(),
-            lazy = file_set.file_infos.iter().any(|info| !info.keep_open),
-            "journal opened"
-        );
+        debug!(n_files = file_infos.len(), "journal opened");
 
         Ok(Self {
             inner: Arc::new(JournalInner {
                 config,
                 roots: discovery.roots,
-                file_infos: file_set.file_infos,
+                file_infos,
             }),
         })
     }
 
     /// Start building a query over the currently opened journal files.
     pub fn query(&self) -> JournalQuery {
-        JournalQuery::new(self.clone())
+        self.query_with_filter(self.filter())
+    }
+
+    /// Create a reusable filter builder using this reader's query limits.
+    ///
+    /// The same [`Filter`] can be used with [`Journal::query_with_filter`] and live subscriptions.
+    pub fn filter(&self) -> Filter {
+        Filter::new(&self.inner.config)
+    }
+
+    /// Create a query with a reusable filter, enforcing this reader's limits during execution.
+    pub fn query_with_filter(&self, filter: Filter) -> JournalQuery {
+        JournalQuery::new(self.clone(), filter)
     }
 
     /// Create a shared live engine from this journal set.
@@ -142,22 +151,29 @@ impl Journal {
     /// The returned [`LiveJournal`] shares one watcher and one live cursor across all registered
     /// subscriptions.
     pub fn live(&self) -> Result<LiveJournal> {
-        LiveJournal::from_journal(self.clone())
+        LiveJournal::from_journal(self)
     }
 
     /// Create a query positioned at `cursor`, inclusive.
     ///
     /// This is a convenience wrapper around [`Journal::query`] plus cursor positioning.
-    pub fn seek_cursor(&self, cursor: &Cursor) -> Result<JournalQuery> {
+    ///
+    /// Cursor resolution and read errors are reported when the query is executed.
+    pub fn seek_cursor(&self, cursor: &Cursor) -> JournalQuery {
         let mut q = self.query();
-        q.set_cursor_start(cursor.clone(), true)?;
-        Ok(q)
+        q.set_cursor_start(cursor.clone(), true);
+        q
     }
 
-    /// Verify Forward Secure Sealing (TAG objects) for all opened journal files.
+    /// Verify Forward Secure Sealing for all committed objects in every opened journal file.
     ///
-    /// This validates TAG objects against a systemd verification key and returns an error if any
-    /// opened file is sealed but fails verification.
+    /// Every file must be sealed and end at a valid TAG. Unsealed files and an unsealed tail
+    /// after the last TAG return [`SdJournalError::Unsupported`], even when earlier TAGs verify.
+    /// Active journals commonly have such a tail until the writer emits its next TAG.
+    ///
+    /// Authentication covers the immutable object contents specified by systemd's FSS format.
+    /// It does not authenticate mutable indexes or all header fields, replace full structural
+    /// validation, or prove that files or newer authenticated entries have not been removed.
     ///
     /// This is available when the `verify-seal` feature is enabled.
     #[cfg(feature = "verify-seal")]
@@ -165,95 +181,41 @@ impl Journal {
         let key = crate::seal::parse_verification_key(verification_key)?;
         let params = crate::seal::FsprgParams::new(key.seed())?;
 
-        for idx in 0..self.inner.file_count() {
-            let f = self.inner.open_file_by_index(idx)?;
+        for info in &self.inner.file_infos {
+            let f = info.open()?;
             crate::seal::verify_file_seal(&f, &params, &key)?;
         }
         Ok(())
     }
 }
 
-pub(crate) struct JournalFileSet {
-    pub(crate) file_infos: Vec<JournalFileInfo>,
-}
-
-impl JournalInner {
-    pub(crate) fn is_lazy(&self) -> bool {
-        self.file_infos.iter().any(|info| !info.keep_open)
-    }
-
-    pub(crate) fn file_count(&self) -> usize {
-        self.file_infos.len()
-    }
-
-    pub(crate) fn file_info(&self, idx: usize) -> Option<&JournalFileInfo> {
-        self.file_infos.get(idx)
-    }
-
-    pub(crate) fn file_paths(&self) -> Vec<PathBuf> {
-        self.file_infos
-            .iter()
-            .map(|info| info.path.clone())
-            .collect()
-    }
-
-    pub(crate) fn opened_files(&self) -> Option<Vec<JournalFile>> {
-        if self.is_lazy() {
-            return None;
-        }
-        Some(
-            self.file_infos
-                .iter()
-                .map(|info| info.file.clone())
-                .collect(),
-        )
-    }
-
-    pub(crate) fn open_file_by_index(&self, idx: usize) -> Result<JournalFile> {
-        let info = self.file_infos.get(idx).ok_or(SdJournalError::NotFound)?;
+impl JournalFileInfo {
+    pub(crate) fn open(&self) -> Result<JournalFile> {
         // Validate the current path, but retain the header and committed bounds captured at
         // discovery. A new, partially written tail must not invalidate the existing snapshot.
-        info.file.validate_reopen_identity()?;
-        Ok(info.file.clone())
+        self.file.validate_reopen_identity()?;
+        Ok(self.file.clone())
     }
-}
 
-impl JournalFileInfo {
-    fn from_open_file(file: JournalFile, keep_open: bool) -> Self {
-        let path = file.path().to_path_buf();
-        let file_id = file.file_id();
-        let seqnum_id = file.seqnum_id();
-        let entry_range_result = file.entry_range();
-        let entry_range_known = entry_range_result.is_ok();
-        let entry_range = entry_range_result.ok().flatten();
-
+    fn from_open_file(file: JournalFile) -> Self {
         Self {
-            path,
-            file_id,
-            seqnum_id,
-            entry_range,
-            entry_range_known,
-            file: if keep_open {
-                file
-            } else {
-                file.reopen_snapshot()
-            },
-            keep_open,
+            file_id: file.file_id(),
+            seqnum_id: file.seqnum_id(),
+            file,
         }
     }
 }
 
+// Files have already been validated, deduplicated, and converted to reopen snapshots by the
+// live snapshot builder. Take ownership so the selected physical copies cannot be reselected.
 pub(crate) fn journal_from_snapshot_files(
-    roots: Vec<PathBuf>,
-    files: &[JournalFile],
+    files: Vec<JournalFile>,
     config: JournalConfig,
 ) -> Result<Journal> {
     validate_journal_config(&config)?;
-    let mut seen = HashSet::new();
     let file_infos: Vec<JournalFileInfo> = files
-        .iter()
-        .filter(|file| seen.insert(file.file_id()))
-        .map(|file| JournalFileInfo::from_open_file(file.reopen_snapshot(), true))
+        .into_iter()
+        .map(JournalFileInfo::from_open_file)
         .collect();
     if file_infos.is_empty() {
         return Err(SdJournalError::NotFound);
@@ -261,7 +223,7 @@ pub(crate) fn journal_from_snapshot_files(
     Ok(Journal {
         inner: Arc::new(JournalInner {
             config,
-            roots,
+            roots: Vec::new(),
             file_infos,
         }),
     })
@@ -276,75 +238,37 @@ fn validate_journal_config(config: &JournalConfig) -> Result<()> {
     Ok(())
 }
 
-fn open_journal_file_set(paths: Vec<PathBuf>, config: &JournalConfig) -> Result<JournalFileSet> {
-    if paths.len() <= config.max_open_files {
-        open_eager_file_set(paths, config)
-    } else {
-        open_lazy_file_set(paths, config)
-    }
-}
-
-fn open_eager_file_set(paths: Vec<PathBuf>, config: &JournalConfig) -> Result<JournalFileSet> {
+fn open_journal_files(paths: Vec<PathBuf>, config: &JournalConfig) -> Result<Vec<JournalFileInfo>> {
+    let keep_open = paths.len() <= config.max_open_files;
     let mut file_infos = Vec::new();
-    let mut errors = Vec::new();
-    let mut seen: HashSet<[u8; 16]> = HashSet::new();
-    for path in paths {
-        match JournalFile::open(path, config) {
-            Ok(f) => {
-                #[cfg(feature = "tracing")]
-                debug!(path = %f.path().display(), "opened journal file");
-                let info = JournalFileInfo::from_open_file(f, true);
-                if seen.insert(info.file_id) {
-                    file_infos.push(info);
-                }
-            }
-            Err(e) => {
-                #[cfg(feature = "tracing")]
-                warn!(error = %e, "failed to open journal file");
-                errors.push(e)
-            }
-        }
-    }
-
-    if file_infos.is_empty() {
-        return Err(errors
-            .into_iter()
-            .next()
-            .unwrap_or(SdJournalError::NotFound));
-    }
-
-    Ok(JournalFileSet { file_infos })
-}
-
-fn open_lazy_file_set(paths: Vec<PathBuf>, config: &JournalConfig) -> Result<JournalFileSet> {
-    let mut file_infos = Vec::new();
-    let mut errors = Vec::new();
-    let mut seen: HashSet<[u8; 16]> = HashSet::new();
+    let mut first_error = None;
+    let mut seen = HashSet::new();
 
     for path in paths {
-        match JournalFile::open_reopen(path.clone(), config) {
+        let opened = if keep_open {
+            JournalFile::open(path, config)
+        } else {
+            JournalFile::open_reopen(path, config)
+        };
+        match opened {
             Ok(file) => {
-                let info = JournalFileInfo::from_open_file(file, false);
-                if seen.insert(info.file_id) {
-                    file_infos.push(info);
+                #[cfg(feature = "tracing")]
+                debug!(path = %file.path().display(), lazy = !keep_open, "opened journal file");
+                if seen.insert(file.file_id()) {
+                    file_infos.push(JournalFileInfo::from_open_file(file));
                 }
             }
-            Err(e) => {
+            Err(error) => {
                 #[cfg(feature = "tracing")]
-                warn!(error = %e, "failed to validate journal file for lazy open");
-                errors.push(e);
+                warn!(error = %error, "failed to open journal file");
+                first_error.get_or_insert(error);
             }
         }
     }
-
     if file_infos.is_empty() {
-        return Err(errors
-            .into_iter()
-            .next()
-            .unwrap_or(SdJournalError::NotFound));
+        return Err(first_error.unwrap_or(SdJournalError::NotFound));
     }
-
-    Ok(JournalFileSet { file_infos })
+    Ok(file_infos)
 }
 
 pub(crate) fn discover_journal_candidates(
@@ -362,26 +286,23 @@ pub(crate) fn discover_journal_candidates(
     roots.dedup();
 
     let mut candidates = BTreeSet::new();
-    let mut first_discover_error: Option<SdJournalError> = None;
+    let mut missing_roots = Vec::new();
     for p in &roots {
         match discover_journal_paths(p, config, &mut candidates) {
-            Err(e @ SdJournalError::LimitExceeded { .. }) => return Err(e),
-            Err(e) if first_discover_error.is_none() => {
-                #[cfg(feature = "tracing")]
-                warn!(path = %p.display(), error = %e, "journal discovery failed");
-                first_discover_error = Some(e);
+            Ok(()) => {}
+            Err(error) if matches!(&error, SdJournalError::Io { source, .. } if source.kind() == ErrorKind::NotFound) =>
+            {
+                // The default runtime and persistent roots need not both exist.
+                missing_roots.push(p.clone());
             }
-            _ => {}
+            Err(error) => return Err(error),
         }
-    }
-
-    if candidates.is_empty() {
-        return Err(first_discover_error.unwrap_or(SdJournalError::NotFound));
     }
 
     Ok(JournalDiscovery {
         roots,
         candidates: candidates.into_iter().collect(),
+        missing_roots,
     })
 }
 
@@ -390,54 +311,38 @@ fn discover_journal_paths(
     config: &JournalConfig,
     out: &mut BTreeSet<PathBuf>,
 ) -> Result<()> {
-    let rd = std::fs::read_dir(dir)
-        .map_err(|e| SdJournalError::io("read_dir", Some(dir.to_path_buf()), e))?;
-
-    let mut machine_id_dirs: Vec<PathBuf> = Vec::new();
-
-    for entry in rd {
-        let entry =
-            entry.map_err(|e| SdJournalError::io("read_dir_entry", Some(dir.to_path_buf()), e))?;
-        let ft = entry
-            .file_type()
-            .map_err(|e| SdJournalError::io("file_type", Some(entry.path()), e))?;
-
-        if ft.is_symlink() {
-            continue;
-        }
-
-        if ft.is_dir() {
-            let name = entry.file_name();
-            if is_machine_id_dir(&name) {
-                machine_id_dirs.push(entry.path());
-            }
-            continue;
-        }
-
-        if !ft.is_file() {
-            continue;
-        }
-
-        if is_journal_file(&entry.path(), config) {
-            insert_journal_candidate(out, entry.path(), config)?;
-        }
-    }
-
-    for mid in machine_id_dirs {
-        let rd = match std::fs::read_dir(&mid) {
+    let mut pending_dirs = vec![(dir.to_path_buf(), true)];
+    while let Some((path, is_root)) = pending_dirs.pop() {
+        let rd = match std::fs::read_dir(&path) {
             Ok(rd) => rd,
-            Err(e) => return Err(SdJournalError::io("read_dir", Some(mid), e)),
+            Err(error) if !is_root && error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => return Err(SdJournalError::io("read_dir", Some(path), error)),
         };
         for entry in rd {
-            let entry = entry
-                .map_err(|e| SdJournalError::io("read_dir_entry", Some(dir.to_path_buf()), e))?;
-            let ft = entry
-                .file_type()
-                .map_err(|e| SdJournalError::io("file_type", Some(entry.path()), e))?;
-            if ft.is_symlink() || !ft.is_file() {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(SdJournalError::io(
+                        "read_dir_entry",
+                        Some(path.clone()),
+                        error,
+                    ));
+                }
+            };
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(SdJournalError::io("file_type", Some(entry.path()), error));
+                }
+            };
+            if file_type.is_symlink() {
                 continue;
             }
-            if is_journal_file(&entry.path(), config) {
+            if file_type.is_dir() && is_root && is_machine_id_dir(&entry.file_name()) {
+                pending_dirs.push((entry.path(), false));
+            } else if file_type.is_file() && is_journal_file(&entry.path(), config) {
                 insert_journal_candidate(out, entry.path(), config)?;
             }
         }
@@ -461,7 +366,7 @@ fn insert_journal_candidate(
     Ok(())
 }
 
-fn is_machine_id_dir(name: &OsStr) -> bool {
+pub(crate) fn is_machine_id_dir(name: &OsStr) -> bool {
     let s = match name.to_str() {
         Some(s) => s,
         None => return false,
@@ -495,6 +400,25 @@ mod tests {
             Ok(_) => panic!("expected InvalidQuery"),
             Err(other) => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn discovery_distinguishes_missing_roots_from_existing_empty_roots() {
+        let empty = tempdir().unwrap();
+        let missing = empty.path().join("not-present");
+        let roots = [empty.path().to_path_buf(), missing.clone()];
+        let discovery = discover_journal_candidates(&roots, &JournalConfig::default()).unwrap();
+        assert!(discovery.candidates.is_empty());
+        assert_eq!(discovery.missing_roots, std::slice::from_ref(&missing));
+        assert!(matches!(
+            Journal::open_dirs(&roots),
+            Err(SdJournalError::NotFound)
+        ));
+
+        File::create(empty.path().join("candidate.journal")).unwrap();
+        let discovery = discover_journal_candidates(&roots, &JournalConfig::default()).unwrap();
+        assert_eq!(discovery.candidates.len(), 1);
+        assert_eq!(discovery.missing_roots, [missing]);
     }
 
     #[test]
